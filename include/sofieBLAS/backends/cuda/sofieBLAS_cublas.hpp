@@ -380,6 +380,13 @@ private:
     }
   }
 
+  // create the layout on lookup if missing (runtime dims with dynamic shapes),
+  // ld = rows since the store assumes dense layouts
+  cublasLtMatrixLayout_t getOrCreateLayout(const std::pair<std::size_t, std::size_t> &key) {
+    checkAndAddLayout(key.first, key.second, key.first);
+    return layoutStore.at(key);
+  }
+
   cublasLtMatmulDesc_t &getOrCreateDesc(cublasOperation_t transA,
                                          cublasOperation_t transB,
                                          cublasLtEpilogue_t epilogue) {
@@ -425,8 +432,8 @@ private:
     int returnedResults = 0;
     CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(
         ltHandle, desc,
-        layoutStore.at(kA), layoutStore.at(kB),
-        layoutStore.at(kC), layoutStore.at(kC),
+        getOrCreateLayout(kA), getOrCreateLayout(kB),
+        getOrCreateLayout(kC), getOrCreateLayout(kC),
         preference, 1, &h, &returnedResults));
     if (returnedResults == 0) {
       std::cerr << "[sofieBLAS] No suitable cuBLASLt algorithm found for "
