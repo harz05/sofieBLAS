@@ -90,6 +90,10 @@ struct AlgoKeyHash {
   }
 };
 
+#ifndef SOFIEBLAS_LAYOUT_MUTATE
+#define SOFIEBLAS_LAYOUT_MUTATE 0   // 1 = Fix 2 (mutate one layout per role); 0 = Fix 1 (register-on-miss)
+#endif
+
 class BlasCuda {
   cublasLtHandle_t           ltHandle   = nullptr;
   cublasHandle_t             handle     = nullptr;  // legacy cuBLAS for batched ops
@@ -106,6 +110,10 @@ class BlasCuda {
 
   std::unordered_map<AlgoKey, cublasLtMatmulHeuristicResult_t, AlgoKeyHash>
       algoCache;
+
+  // one persistent layout per matrix role, re-stamped with runtime dims each call
+  enum LayoutRole { ROLE_A, ROLE_B, ROLE_C };
+  cublasLtMatrixLayout_t mutLayout[3] = {};
 
 public:
   BlasCuda(const BlasCuda &) = delete;
@@ -131,6 +139,8 @@ public:
   ~BlasCuda() {
     for (auto &[key, layout] : layoutStore)
       if (layout) cublasLtMatrixLayoutDestroy(layout);
+    for (auto L : mutLayout)
+      if (L) cublasLtMatrixLayoutDestroy(L);
     for (auto &[key, desc] : descStore)
       if (desc) cublasLtMatmulDescDestroy(desc);
     if (preference)  cublasLtMatmulPreferenceDestroy(preference);
@@ -387,6 +397,30 @@ private:
     return layoutStore.at(key);
   }
 
+  // resolve a matrix role's layout at runtime dims per the selected strategy
+  cublasLtMatrixLayout_t layoutFor(LayoutRole role,
+                                   const std::pair<std::size_t, std::size_t> &key) {
+#if SOFIEBLAS_LAYOUT_MUTATE
+    const uint64_t rows = key.first, cols = key.second;
+    const int64_t  ld   = static_cast<int64_t>(key.first);  // dense, ld = rows
+    auto &L = mutLayout[role];
+    if (!L) {
+      CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&L, CUDA_R_32F, rows, cols, ld));
+    } else {
+      CHECK_CUBLAS(cublasLtMatrixLayoutSetAttribute(
+          L, CUBLASLT_MATRIX_LAYOUT_ROWS, &rows, sizeof(rows)));
+      CHECK_CUBLAS(cublasLtMatrixLayoutSetAttribute(
+          L, CUBLASLT_MATRIX_LAYOUT_COLS, &cols, sizeof(cols)));
+      CHECK_CUBLAS(cublasLtMatrixLayoutSetAttribute(
+          L, CUBLASLT_MATRIX_LAYOUT_LD, &ld, sizeof(ld)));
+    }
+    return L;
+#else
+    (void)role;
+    return getOrCreateLayout(key);
+#endif
+  }
+
   cublasLtMatmulDesc_t &getOrCreateDesc(cublasOperation_t transA,
                                          cublasOperation_t transB,
                                          cublasLtEpilogue_t epilogue) {
@@ -432,8 +466,8 @@ private:
     int returnedResults = 0;
     CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(
         ltHandle, desc,
-        getOrCreateLayout(kA), getOrCreateLayout(kB),
-        getOrCreateLayout(kC), getOrCreateLayout(kC),
+        layoutFor(ROLE_A, kA), layoutFor(ROLE_B, kB),
+        layoutFor(ROLE_C, kC), layoutFor(ROLE_C, kC),
         preference, 1, &h, &returnedResults));
     if (returnedResults == 0) {
       std::cerr << "[sofieBLAS] No suitable cuBLASLt algorithm found for "
@@ -468,10 +502,10 @@ private:
 
     CHECK_CUBLAS(cublasLtMatmul(
         ltHandle, desc,
-        &alpha, A, layoutStore.at(kA),
-                B, layoutStore.at(kB),
-        &beta, D_in, layoutStore.at(kC),
-               C_out, layoutStore.at(kC),
+        &alpha, A, layoutFor(ROLE_A, kA),
+                B, layoutFor(ROLE_B, kB),
+        &beta, D_in, layoutFor(ROLE_C, kC),
+               C_out, layoutFor(ROLE_C, kC),
         &h.algo, d_workspace, workspaceSize, stream));
   }
 };
