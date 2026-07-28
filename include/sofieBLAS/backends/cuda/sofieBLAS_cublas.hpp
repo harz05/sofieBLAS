@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "sofieBLAS/core.hpp"
 #include <alpaka/alpaka.hpp>
@@ -74,6 +75,47 @@ struct AlgoKeyHash {
   }
 };
 
+// 0 = tune per runtime shape, 1 = tune once per bucket and reuse.
+// Layouts are stamped with the exact runtime dims either way; only the
+// choice of algorithm is shared across a bucket.
+#ifndef SOFIEBLAS_LAYOUT_PROFILE
+#define SOFIEBLAS_LAYOUT_PROFILE 1
+#endif
+
+// Candidates timed when tuning a bucket. 1 takes the heuristic's first pick.
+#ifndef SOFIEBLAS_LAYOUT_TUNE_CANDIDATES
+#define SOFIEBLAS_LAYOUT_TUNE_CANDIDATES 1
+#endif
+
+#ifndef SOFIEBLAS_LAYOUT_BUCKET_MIN
+#define SOFIEBLAS_LAYOUT_BUCKET_MIN 8
+#endif
+
+// 0 = never validate a bucket's algorithm, 1 = once when the bucket is tuned,
+// 2 = on every call. Only the algorithm is taken from the check; the workspace
+// handed to cublasLtMatmul is the full allocation either way.
+#ifndef SOFIEBLAS_LAYOUT_VALIDATE
+#define SOFIEBLAS_LAYOUT_VALIDATE 1
+#endif
+
+struct AlgoProfile {
+  cublasLtMatmulHeuristicResult_t tuned{};
+  cublasLtMatmulHeuristicResult_t lastValid{};
+  AlgoKey lastExact{};
+  bool    haveLast = false;
+  bool    usable   = true;
+};
+
+struct LayoutStats {
+  std::size_t matmuls          = 0;
+  std::size_t heuristicQueries = 0;
+  std::size_t algoChecks       = 0;
+  std::size_t algoCheckRejects = 0;
+  std::size_t memoHits         = 0;
+  std::size_t exactFallbacks   = 0;
+  std::size_t tuningRuns       = 0;
+};
+
 class BlasCuda {
   cublasLtHandle_t           ltHandle   = nullptr;
   cublasHandle_t             handle     = nullptr;  // legacy cuBLAS for batched ops
@@ -94,7 +136,16 @@ class BlasCuda {
   std::unordered_map<AlgoKey, cublasLtMatmulHeuristicResult_t, AlgoKeyHash>
       algoCache;
 
+  // keyed by bucketed dims, one tuned algorithm per bucket
+  std::unordered_map<AlgoKey, AlgoProfile, AlgoKeyHash> profileStore;
+
+  LayoutStats stats;
+
 public:
+  const LayoutStats &layoutStats() const { return stats; }
+  std::size_t profileCount()      const { return profileStore.size(); }
+  std::size_t algoCacheSize()     const { return algoCache.size(); }
+
   BlasCuda(const BlasCuda &) = delete;
   BlasCuda &operator=(const BlasCuda &) = delete;
   BlasCuda(BlasCuda &&) = delete;
@@ -365,6 +416,152 @@ private:
     return L;
   }
 
+  static std::size_t bucketUp(std::size_t x) {
+    std::size_t b = SOFIEBLAS_LAYOUT_BUCKET_MIN;
+    while (b < x) b <<= 1;
+    return b;
+  }
+
+  // Time the candidates at the exact runtime shape (the buffers are only valid
+  // at that size) and return the fastest usable one.
+  cublasLtMatmulHeuristicResult_t
+  pickFastest(cublasLtMatmulDesc_t desc,
+              const std::pair<std::size_t, std::size_t> &kA,
+              const std::pair<std::size_t, std::size_t> &kB,
+              const std::pair<std::size_t, std::size_t> &kC,
+              std::vector<cublasLtMatmulHeuristicResult_t> &cand, int got,
+              float alpha, const float *A, const float *B,
+              float beta, const float *D_in, float *C_out) {
+    auto lA = stampLayout(ROLE_A, kA);
+    auto lB = stampLayout(ROLE_B, kB);
+    auto lC = stampLayout(ROLE_C, kC);
+
+    cudaEvent_t e0, e1;
+    CHECK_CUDA(cudaEventCreate(&e0));
+    CHECK_CUDA(cudaEventCreate(&e1));
+
+    const int reps = 3;
+    int   best  = -1;
+    float bestMs = 0.f;
+    for (int i = 0; i < got; ++i) {
+      cublasLtMatmulHeuristicResult_t chk{};
+      if (cublasLtMatmulAlgoCheck(ltHandle, desc, lA, lB, lC, lC,
+                                  &cand[i].algo, &chk) != CUBLAS_STATUS_SUCCESS)
+        continue;
+      if (chk.workspaceSize > workspaceSize)
+        continue;
+
+      auto run = [&] {
+        CHECK_CUBLAS(cublasLtMatmul(ltHandle, desc, &alpha, A, lA, B, lB,
+                                    &beta, D_in, lC, C_out, lC,
+                                    &cand[i].algo, d_workspace, workspaceSize,
+                                    stream));
+      };
+      run();
+      CHECK_CUDA(cudaEventRecord(e0, stream));
+      for (int r = 0; r < reps; ++r) run();
+      CHECK_CUDA(cudaEventRecord(e1, stream));
+      CHECK_CUDA(cudaEventSynchronize(e1));
+      stats.tuningRuns += reps + 1;
+
+      float ms = 0.f;
+      CHECK_CUDA(cudaEventElapsedTime(&ms, e0, e1));
+      if (best < 0 || ms < bestMs) { best = i; bestMs = ms; }
+    }
+
+    CHECK_CUDA(cudaEventDestroy(e0));
+    CHECK_CUDA(cudaEventDestroy(e1));
+    return cand[best < 0 ? 0 : best];
+  }
+
+  cublasLtMatmulHeuristicResult_t
+  resolveProfiled(cublasLtMatmulDesc_t desc, cublasOperation_t transA,
+                  cublasOperation_t transB, cublasLtEpilogue_t epilogue,
+                  const std::pair<std::size_t, std::size_t> &kA,
+                  const std::pair<std::size_t, std::size_t> &kB,
+                  const std::pair<std::size_t, std::size_t> &kC,
+                  float alpha, const float *A, const float *B,
+                  float beta, const float *D_in, float *C_out) {
+    const DescKey dk{(int)transA, (int)transB, (int)epilogue};
+    const AlgoKey bkey{dk, bucketUp(kA.first), bucketUp(kA.second),
+                           bucketUp(kB.first), bucketUp(kB.second)};
+
+    auto it = profileStore.find(bkey);
+    if (it == profileStore.end()) {
+      // Query at the bucket bound. This only touches host-side descriptors,
+      // so it is safe even though the buffers are sized for the runtime shape.
+      const std::pair<std::size_t, std::size_t>
+          bA{bucketUp(kA.first), bucketUp(kA.second)},
+          bB{bucketUp(kB.first), bucketUp(kB.second)},
+          bC{bucketUp(kC.first), bucketUp(kC.second)};
+      auto lA = stampLayout(ROLE_A, bA);
+      auto lB = stampLayout(ROLE_B, bB);
+      auto lC = stampLayout(ROLE_C, bC);
+
+      const int want = SOFIEBLAS_LAYOUT_TUNE_CANDIDATES;
+      std::vector<cublasLtMatmulHeuristicResult_t> cand(want);
+      int got = 0;
+      CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(
+          ltHandle, desc, lA, lB, lC, lC, preference, want, cand.data(), &got));
+      ++stats.heuristicQueries;
+      if (got == 0) {
+        std::cerr << "[sofieBLAS] No cuBLASLt algorithm for bucket "
+                  << bA.first << "x" << bA.second << " * "
+                  << bB.first << "x" << bB.second << "\n";
+        exit(EXIT_FAILURE);
+      }
+
+      AlgoProfile p{};
+      // beta != 0 accumulates, so a candidate cannot be run more than once.
+      p.tuned = (want > 1 && got > 1 && beta == 0.0f)
+                    ? pickFastest(desc, kA, kB, kC, cand, got,
+                                  alpha, A, B, beta, D_in, C_out)
+                    : cand[0];
+#if SOFIEBLAS_LAYOUT_VALIDATE == 1
+      p.usable = checkAlgo(desc, p.tuned.algo, kA, kB, kC);
+      if (!p.usable) ++stats.algoCheckRejects;
+#endif
+      it = profileStore.emplace(bkey, p).first;
+    }
+
+    AlgoProfile &p = it->second;
+
+#if SOFIEBLAS_LAYOUT_VALIDATE >= 2
+    const AlgoKey exact{dk, kA.first, kA.second, kB.first, kB.second};
+    if (p.haveLast && p.lastExact == exact) {
+      ++stats.memoHits;
+      return p.lastValid;
+    }
+    if (checkAlgo(desc, p.tuned.algo, kA, kB, kC)) {
+      p.lastExact = exact;
+      p.lastValid = p.tuned;
+      p.haveLast  = true;
+      return p.tuned;
+    }
+    ++stats.algoCheckRejects;
+#else
+    if (p.usable)
+      return p.tuned;
+#endif
+
+    ++stats.exactFallbacks;
+    return getOrComputeAlgo(transA, transB, epilogue, kA, kB, kC);
+  }
+
+  bool checkAlgo(cublasLtMatmulDesc_t desc, const cublasLtMatmulAlgo_t &algo,
+                 const std::pair<std::size_t, std::size_t> &kA,
+                 const std::pair<std::size_t, std::size_t> &kB,
+                 const std::pair<std::size_t, std::size_t> &kC) {
+    auto lA = stampLayout(ROLE_A, kA);
+    auto lB = stampLayout(ROLE_B, kB);
+    auto lC = stampLayout(ROLE_C, kC);
+    cublasLtMatmulHeuristicResult_t chk{};
+    const cublasStatus_t st =
+        cublasLtMatmulAlgoCheck(ltHandle, desc, lA, lB, lC, lC, &algo, &chk);
+    ++stats.algoChecks;
+    return st == CUBLAS_STATUS_SUCCESS && chk.workspaceSize <= workspaceSize;
+  }
+
   cublasLtMatmulDesc_t &getOrCreateDesc(cublasOperation_t transA,
                                          cublasOperation_t transB,
                                          cublasLtEpilogue_t epilogue) {
@@ -414,6 +611,7 @@ private:
     CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(
         ltHandle, desc, lA, lB, lC, lC,
         preference, 1, &h, &returnedResults));
+    ++stats.heuristicQueries;
     if (returnedResults == 0) {
       std::cerr << "[sofieBLAS] No suitable cuBLASLt algorithm found for "
                 << "transA=" << transA << " transB=" << transB
@@ -434,10 +632,9 @@ private:
                      const std::pair<std::size_t, std::size_t> &kA,
                      const std::pair<std::size_t, std::size_t> &kB,
                      const std::pair<std::size_t, std::size_t> &kC) {
-    // Retrieve (or lazily compute) the cached algorithm for this shape
-    auto &h = getOrComputeAlgo(transA, transB, epilogue, kA, kB, kC);
+    ++stats.matmuls;
 
-    // Retrieve the cached descriptor and patch the real bias pointer in-place
+    // Descriptor first: tuning may need to run the matmul, bias included.
     auto &desc = getOrCreateDesc(transA, transB, epilogue);
     if (bias_ptr) {
       CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
@@ -445,8 +642,17 @@ private:
           &bias_ptr, sizeof(bias_ptr)));
     }
 
-    // Re-stamp the shared role layouts to this call's shape right before the
-    // matmul (the algo-cache hit path in getOrComputeAlgo skips stamping).
+#if SOFIEBLAS_LAYOUT_PROFILE
+    cublasLtMatmulHeuristicResult_t h =
+        resolveProfiled(desc, transA, transB, epilogue, kA, kB, kC,
+                        alpha, A, B, beta, D_in, C_out);
+#else
+    cublasLtMatmulHeuristicResult_t h =
+        getOrComputeAlgo(transA, transB, epilogue, kA, kB, kC);
+#endif
+
+    // Re-stamp the shared role layouts to this call's exact shape. Tuning and
+    // validation leave them at other sizes, so this has to happen last.
     auto lA = stampLayout(ROLE_A, kA);
     auto lB = stampLayout(ROLE_B, kB);
     auto lC = stampLayout(ROLE_C, kC);
