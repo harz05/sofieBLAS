@@ -4,6 +4,7 @@
 
 #include <alpaka/alpaka.hpp>
 #include <cuda_runtime.h>
+#include <unistd.h>
 
 #include "sofieBLAS/backends/cuda/sofieBLAS_cublas.hpp"
 
@@ -11,8 +12,25 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
+
+// Resident set size in MB, from /proc/self/statm.
+static double hostRssMB() {
+  FILE *f = std::fopen("/proc/self/statm", "r");
+  if (!f) return 0.0;
+  long total = 0, rss = 0;
+  if (std::fscanf(f, "%ld %ld", &total, &rss) != 2) rss = 0;
+  std::fclose(f);
+  return (double)rss * (double)sysconf(_SC_PAGESIZE) / (1024.0 * 1024.0);
+}
+
+static double gpuUsedMB() {
+  size_t freeB = 0, totalB = 0;
+  cudaMemGetInfo(&freeB, &totalB);
+  return (double)(totalB - freeB) / (1024.0 * 1024.0);
+}
 
 // Which runtime quantity drives m for a given call site.
 enum MKind { M_NPF, M_NSV, M_TOT, M_TOT8 };
@@ -55,7 +73,8 @@ static void cpuGemm(int m, int n, int k, const float *A, const float *B, float *
     }
 }
 
-int main() {
+int main(int argc, char **argv) {
+  const int nEventsArg = (argc > 1) ? std::atoi(argv[1]) : 1000;
   alpaka::PlatformCudaRt plat{};
   auto device = alpaka::getDevByIdx(plat, 0u);
   alpaka::Queue<alpaka::DevCudaRt, alpaka::NonBlocking> queue(device);
@@ -116,13 +135,15 @@ int main() {
   // A run of events with n_pf drawn at random, which is what a real workload
   // looks like: new sizes keep arriving instead of being visited once in order.
   {
-    const int nEvents = 1000;
+    const int nEvents = nEventsArg;
     std::mt19937 r(12345);
     std::uniform_int_distribution<int> pick(NPF_MIN, NPF_MAX);
     std::vector<double> lat;
     lat.reserve(nEvents);
 
     const auto s0 = blas.layoutStats();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    const double rss0 = hostRssMB(), gpu0 = gpuUsedMB();
     double first100 = 0.0, total = 0.0;
     for (int e = 0; e < nEvents; ++e) {
       const int npf = pick(r);
@@ -143,6 +164,8 @@ int main() {
       if (e < 100) first100 += ms;
     }
     const auto s1 = blas.layoutStats();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    const double rss1 = hostRssMB(), gpu1 = gpuUsedMB();
 
     std::vector<double> srt = lat;
     std::sort(srt.begin(), srt.end());
@@ -152,6 +175,8 @@ int main() {
                 first100);
     std::printf("per-event ms: mean=%.4f p50=%.4f p95=%.4f p99=%.4f max=%.4f\n",
                 total / nEvents, pct(0.50), pct(0.95), pct(0.99), srt.back());
+    std::printf("memory MB: hostRss=%.3f growth=%.3f  gpuUsed=%.1f growth=%.1f\n",
+                rss1, rss1 - rss0, gpu1, gpu1 - gpu0);
     std::printf("counters: matmuls=%zu heur=%zu checks=%zu rejects=%zu "
                 "memo=%zu fallback=%zu tuneRuns=%zu\n",
                 s1.matmuls - s0.matmuls,
