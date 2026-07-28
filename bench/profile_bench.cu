@@ -64,11 +64,20 @@ int main() {
   cudaGetDeviceProperties(&prop, 0);
   std::printf("device: %s  SMs=%d  cc=%d.%d\n", prop.name,
               prop.multiProcessorCount, prop.major, prop.minor);
-  std::printf("SOFIEBLAS_LAYOUT_PROFILE=%d  TUNE_CANDIDATES=%d  BUCKET_MIN=%d\n\n",
-              SOFIEBLAS_LAYOUT_PROFILE, SOFIEBLAS_LAYOUT_TUNE_CANDIDATES,
+  std::printf("PROFILE=%d MODE=%d VALIDATE=%d CANDIDATES=%d BUCKET_MIN=%d\n\n",
+              SOFIEBLAS_LAYOUT_PROFILE, SOFIEBLAS_LAYOUT_BUCKET_MODE,
+              SOFIEBLAS_LAYOUT_VALIDATE, SOFIEBLAS_LAYOUT_TUNE_CANDIDATES,
               SOFIEBLAS_LAYOUT_BUCKET_MIN);
 
   BlasCuda blas(queue);
+
+  // Declare each call site's envelope at the maximum n_pf, as the generated
+  // Session constructor does.
+  for (int c = 0; c < kNCalls; ++c) {
+    const int m = mFor(kCalls[c].kind, NPF_MAX);
+    const int n = kCalls[c].n, k = kCalls[c].k;
+    blas.addLayoutConfig(m, n, k, m, k, m, 'n', 'n');
+  }
 
   float *dA = nullptr, *dB = nullptr, *dC = nullptr;
   CHECK_CUDA(cudaMalloc(&dA, sizeof(float) * (size_t)MAXM * MAXK));
@@ -155,7 +164,9 @@ int main() {
   }
 
   const auto s = blas.layoutStats();
-  std::printf("\ntotals: profiles=%zu algoCache=%zu heuristicQueries=%zu\n",
-              blas.profileCount(), blas.algoCacheSize(), s.heuristicQueries);
+  std::printf("\ntotals: profiles=%zu envelopes=%zu algoCache=%zu "
+              "heuristicQueries=%zu\n",
+              blas.profileCount(), blas.envelopeCount(), blas.algoCacheSize(),
+              s.heuristicQueries);
   return 0;
 }

@@ -34,7 +34,8 @@ int main(int argc, char **argv) {
   cudaGetDeviceProperties(&prop, 0);
   std::printf("device: %s  SMs=%d  cc=%d.%d\n", prop.name,
               prop.multiProcessorCount, prop.major, prop.minor);
-  std::printf("SOFIEBLAS_LAYOUT_PROFILE=%d\n\n", SOFIEBLAS_LAYOUT_PROFILE);
+  std::printf("PROFILE=%d MODE=%d VALIDATE=%d\n\n", SOFIEBLAS_LAYOUT_PROFILE,
+              SOFIEBLAS_LAYOUT_BUCKET_MODE, SOFIEBLAS_LAYOUT_VALIDATE);
 
   std::mt19937 rng(1);
   std::uniform_real_distribution<float> u(-1.f, 1.f);
