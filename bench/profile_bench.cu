@@ -75,6 +75,9 @@ static void cpuGemm(int m, int n, int k, const float *A, const float *B, float *
 
 int main(int argc, char **argv) {
   const int nEventsArg = (argc > 1) ? std::atoi(argv[1]) : 1000;
+  // Envelope declared at this n_pf. Below NPF_MAX it leaves the larger sweep
+  // sizes uncovered, which exercises the fallback path.
+  const int npfEnv = (argc > 2) ? std::atoi(argv[2]) : NPF_MAX;
   alpaka::PlatformCudaRt plat{};
   auto device = alpaka::getDevByIdx(plat, 0u);
   alpaka::Queue<alpaka::DevCudaRt, alpaka::NonBlocking> queue(device);
@@ -83,15 +86,16 @@ int main(int argc, char **argv) {
   cudaGetDeviceProperties(&prop, 0);
   std::printf("device: %s  SMs=%d  cc=%d.%d\n", prop.name,
               prop.multiProcessorCount, prop.major, prop.minor);
-  std::printf("PROFILE=%d WARMUP=%d\n\n", SOFIEBLAS_LAYOUT_PROFILE,
-              SOFIEBLAS_LAYOUT_WARMUP);
+  std::printf("PROFILE=%d WARMUP=%d envelope_n_pf=%d sweep_n_pf=%d..%d\n\n",
+              SOFIEBLAS_LAYOUT_PROFILE, SOFIEBLAS_LAYOUT_WARMUP, npfEnv,
+              NPF_MIN, NPF_MAX);
 
   BlasCuda blas(queue);
 
-  // Declare each call site's envelope at the maximum n_pf, as the generated
-  // Session constructor does.
+  // Declare each call site's envelope, as the generated Session constructor
+  // does with its own n_pf argument.
   for (int c = 0; c < kNCalls; ++c) {
-    const int m = mFor(kCalls[c].kind, NPF_MAX);
+    const int m = mFor(kCalls[c].kind, npfEnv);
     const int n = kCalls[c].n, k = kCalls[c].k;
     blas.addLayoutConfig(m, n, k, m, k, m, 'n', 'n');
   }
@@ -109,13 +113,13 @@ int main(int argc, char **argv) {
   CHECK_CUDA(cudaMemcpy(dA, hA.data(), sizeof(float) * hA.size(), cudaMemcpyHostToDevice));
   CHECK_CUDA(cudaMemcpy(dB, hB.data(), sizeof(float) * hB.size(), cudaMemcpyHostToDevice));
 
-  // Numerics: one shape per distinct (n,k) at a size well below every envelope,
-  // so the algorithm in use was resolved for a larger shape.
-  {
+  // Run every call site at a given m and compare against a CPU reference.
+  auto checkNumerics = [&](int m, const char *tag) {
     std::vector<float> hC, ref;
     float worst = 0.f;
+    const std::size_t missBefore = blas.layoutStats().envelopeMisses;
     for (int c = 0; c < kNCalls; ++c) {
-      const int m = 37, n = kCalls[c].n, k = kCalls[c].k;
+      const int n = kCalls[c].n, k = kCalls[c].k;
       blas.matmul('n', 'n', (unsigned)m, (unsigned)n, (unsigned)k, 1.0f,
                   (const float *)dA, (const float *)dB, 0.0f, dC);
       CHECK_CUDA(cudaDeviceSynchronize());
@@ -126,9 +130,17 @@ int main(int argc, char **argv) {
       for (size_t i = 0; i < ref.size(); ++i)
         worst = std::max(worst, std::fabs(hC[i] - ref[i]));
     }
-    std::printf("numerics: worst abs err vs CPU = %.3e  %s\n\n",
-                worst, worst < 1e-3f ? "OK" : "FAIL");
-  }
+    std::printf("numerics %-16s m=%-5d worst=%.3e  envMisses=%zu  %s\n", tag, m,
+                worst, blas.layoutStats().envelopeMisses - missBefore,
+                worst < 1e-3f ? "OK" : "FAIL");
+  };
+
+  // Inside every envelope, so the algorithm in use was resolved at a larger
+  // shape. Then at the largest sweep size, which overflows the envelope when
+  // it was declared below NPF_MAX and so takes the fallback path.
+  checkNumerics(37, "in-envelope");
+  checkNumerics(mFor(M_NPF, NPF_MAX), "sweep-max");
+  std::printf("\n");
 
   // A run of events with n_pf drawn at random, which is what a real workload
   // looks like: new sizes keep arriving instead of being visited once in order.

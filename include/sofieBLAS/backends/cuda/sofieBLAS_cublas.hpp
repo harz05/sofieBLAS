@@ -442,8 +442,12 @@ private:
     const ShapeEnvelope *best = nullptr;
     std::size_t bestExcess = std::numeric_limits<std::size_t>::max();
     for (const auto &e : envelopes) {
-      if (e.rowsA < kA.first || e.colsA < kA.second ||
-          e.rowsB < kB.first || e.colsB < kB.second ||
+      // colsA and rowsB are both the contraction dimension k, which comes from
+      // the weight tensor and never varies at runtime. Requiring an exact match
+      // on it stops one call site's envelope from serving another's shapes.
+      if (e.colsA != kA.second || e.rowsB != kB.first)
+        continue;
+      if (e.rowsA < kA.first || e.colsB < kB.second ||
           e.rowsC < kC.first || e.colsC < kC.second)
         continue;
       const std::size_t ex = (e.rowsA - kA.first) + (e.colsA - kA.second) +
