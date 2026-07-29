@@ -83,10 +83,8 @@ int main(int argc, char **argv) {
   cudaGetDeviceProperties(&prop, 0);
   std::printf("device: %s  SMs=%d  cc=%d.%d\n", prop.name,
               prop.multiProcessorCount, prop.major, prop.minor);
-  std::printf("PROFILE=%d MODE=%d VALIDATE=%d CANDIDATES=%d BUCKET_MIN=%d\n\n",
-              SOFIEBLAS_LAYOUT_PROFILE, SOFIEBLAS_LAYOUT_BUCKET_MODE,
-              SOFIEBLAS_LAYOUT_VALIDATE, SOFIEBLAS_LAYOUT_TUNE_CANDIDATES,
-              SOFIEBLAS_LAYOUT_BUCKET_MIN);
+  std::printf("PROFILE=%d WARMUP=%d\n\n", SOFIEBLAS_LAYOUT_PROFILE,
+              SOFIEBLAS_LAYOUT_WARMUP);
 
   BlasCuda blas(queue);
 
@@ -111,8 +109,8 @@ int main(int argc, char **argv) {
   CHECK_CUDA(cudaMemcpy(dA, hA.data(), sizeof(float) * hA.size(), cudaMemcpyHostToDevice));
   CHECK_CUDA(cudaMemcpy(dB, hB.data(), sizeof(float) * hB.size(), cudaMemcpyHostToDevice));
 
-  // Numerics: one shape per distinct (n,k), at a size no bucket bound equals,
-  // so the algorithm in use was tuned for a larger shape.
+  // Numerics: one shape per distinct (n,k) at a size well below every envelope,
+  // so the algorithm in use was resolved for a larger shape.
   {
     std::vector<float> hC, ref;
     float worst = 0.f;
@@ -177,21 +175,16 @@ int main(int argc, char **argv) {
                 total / nEvents, pct(0.50), pct(0.95), pct(0.99), srt.back());
     std::printf("memory MB: hostRss=%.3f growth=%.3f  gpuUsed=%.1f growth=%.1f\n",
                 rss1, rss1 - rss0, gpu1, gpu1 - gpu0);
-    std::printf("counters: matmuls=%zu heur=%zu checks=%zu rejects=%zu "
-                "memo=%zu fallback=%zu tuneRuns=%zu\n",
+    std::printf("counters: matmuls=%zu heur=%zu envMisses=%zu\n",
                 s1.matmuls - s0.matmuls,
                 s1.heuristicQueries - s0.heuristicQueries,
-                s1.algoChecks - s0.algoChecks,
-                s1.algoCheckRejects - s0.algoCheckRejects,
-                s1.memoHits - s0.memoHits,
-                s1.exactFallbacks - s0.exactFallbacks,
-                s1.tuningRuns - s0.tuningRuns);
+                s1.envelopeMisses - s0.envelopeMisses);
   }
 
   const auto s = blas.layoutStats();
-  std::printf("\ntotals: profiles=%zu envelopes=%zu algoCache=%zu "
-              "heuristicQueries=%zu\n",
-              blas.profileCount(), blas.envelopeCount(), blas.algoCacheSize(),
-              s.heuristicQueries);
+  std::printf("\ntotals: envelopes=%zu algoCache=%zu heuristicQueries=%zu "
+              "(warmup=%zu)\n",
+              blas.envelopeCount(), blas.algoCacheSize(), s.heuristicQueries,
+              s.warmupQueries);
   return 0;
 }

@@ -76,26 +76,20 @@ struct AlgoKeyHash {
   }
 };
 
-// 0 = tune per runtime shape, 1 = tune once per bucket and reuse.
-// Layouts are stamped with the exact runtime dims either way; only the
-// choice of algorithm is shared across a bucket.
+// 0 = resolve the algorithm per runtime shape, so algoCache holds one entry
+//     per distinct size and every new size pays a heuristic query
+// 1 = resolve it per call site, at the envelope addLayoutConfig declares, so
+//     every size that call site produces shares one entry
+// The matmul runs at the exact runtime dims either way; only the choice of
+// algorithm is shared.
 #ifndef SOFIEBLAS_LAYOUT_PROFILE
 #define SOFIEBLAS_LAYOUT_PROFILE 1
 #endif
 
-// Candidates timed when tuning a bucket. 1 takes the heuristic's first pick.
-#ifndef SOFIEBLAS_LAYOUT_TUNE_CANDIDATES
-#define SOFIEBLAS_LAYOUT_TUNE_CANDIDATES 1
-#endif
-
-#ifndef SOFIEBLAS_LAYOUT_BUCKET_MIN
-#define SOFIEBLAS_LAYOUT_BUCKET_MIN 8
-#endif
-
-// 0 = power-of-two bucket ladder, 1 = one profile per call site, tuned at the
-// envelope the generated constructor declares through addLayoutConfig.
-#ifndef SOFIEBLAS_LAYOUT_BUCKET_MODE
-#define SOFIEBLAS_LAYOUT_BUCKET_MODE 0
+// Resolve each declared envelope in the constructor, so the first infer()
+// finds every algorithm already cached.
+#ifndef SOFIEBLAS_LAYOUT_WARMUP
+#define SOFIEBLAS_LAYOUT_WARMUP 1
 #endif
 
 // A call site's maximum shape, as declared by addLayoutConfig from the
@@ -104,29 +98,11 @@ struct ShapeEnvelope {
   std::size_t rowsA, colsA, rowsB, colsB, rowsC, colsC;
 };
 
-// 0 = never validate a bucket's algorithm, 1 = once when the bucket is tuned,
-// 2 = on every call. Only the algorithm is taken from the check; the workspace
-// handed to cublasLtMatmul is the full allocation either way.
-#ifndef SOFIEBLAS_LAYOUT_VALIDATE
-#define SOFIEBLAS_LAYOUT_VALIDATE 1
-#endif
-
-struct AlgoProfile {
-  cublasLtMatmulHeuristicResult_t tuned{};
-  cublasLtMatmulHeuristicResult_t lastValid{};
-  AlgoKey lastExact{};
-  bool    haveLast = false;
-  bool    usable   = true;
-};
-
 struct LayoutStats {
   std::size_t matmuls          = 0;
   std::size_t heuristicQueries = 0;
-  std::size_t algoChecks       = 0;
-  std::size_t algoCheckRejects = 0;
-  std::size_t memoHits         = 0;
-  std::size_t exactFallbacks   = 0;
-  std::size_t tuningRuns       = 0;
+  std::size_t warmupQueries    = 0;  // of which resolved in the constructor
+  std::size_t envelopeMisses   = 0;  // calls no declared envelope covered
 };
 
 class BlasCuda {
@@ -149,10 +125,7 @@ class BlasCuda {
   std::unordered_map<AlgoKey, cublasLtMatmulHeuristicResult_t, AlgoKeyHash>
       algoCache;
 
-  // keyed by bucketed dims, one tuned algorithm per bucket
-  std::unordered_map<AlgoKey, AlgoProfile, AlgoKeyHash> profileStore;
-
-  // bucket mode 1: call-site envelopes declared by addLayoutConfig
+  // call-site envelopes declared by addLayoutConfig
   std::vector<ShapeEnvelope> envelopes;
 
   LayoutStats stats;
@@ -160,7 +133,6 @@ class BlasCuda {
 public:
   const LayoutStats &layoutStats() const { return stats; }
   std::size_t algoCacheSize()     const { return algoCache.size(); }
-  std::size_t profileCount()      const { return profileStore.size(); }
   std::size_t envelopeCount()     const { return envelopes.size(); }
 
   BlasCuda(const BlasCuda &) = delete;
@@ -204,16 +176,34 @@ public:
     }
   }
 
-  // Layouts are created lazily, so this no longer registers anything. The
-  // generated constructor evaluates the shape expressions with its own
-  // parameters, so for a dynamic model these are the largest dims the call
-  // site will see, which is the point bucket mode 1 tunes at.
+  // Records the call site's envelope. The generated constructor evaluates its
+  // shape expressions with its own parameters, so for a dynamic model these are
+  // the largest dims the call site will ever use. Layouts are created lazily,
+  // so nothing is registered here beyond the envelope and, with warmup on, the
+  // algorithm resolved for it.
   void addLayoutConfig(std::size_t m, std::size_t n, std::size_t k,
                        std::size_t, std::size_t, std::size_t,
                        char transa, char transb) {
     const auto kA = layoutKeyA(transa, m, k);
     const auto kB = layoutKeyB(transb, k, n);
+    const std::pair<std::size_t, std::size_t> kC{m, n};
     envelopes.push_back({kA.first, kA.second, kB.first, kB.second, m, n});
+
+#if SOFIEBLAS_LAYOUT_PROFILE && SOFIEBLAS_LAYOUT_WARMUP
+    // The constructor does not know which epilogue this call site uses, so
+    // resolve all three. Unused ones cost one heuristic query each, off the
+    // inference path.
+    const cublasOperation_t tA = charToCuBlasTranspose(transa);
+    const cublasOperation_t tB = charToCuBlasTranspose(transb);
+    const cublasLtEpilogue_t eps[] = {CUBLASLT_EPILOGUE_DEFAULT,
+                                      CUBLASLT_EPILOGUE_BIAS,
+                                      CUBLASLT_EPILOGUE_RELU_BIAS};
+    for (cublasLtEpilogue_t ep : eps) {
+      const std::size_t before = stats.heuristicQueries;
+      getOrComputeAlgo(tA, tB, ep, kA, kB, kC, /*required=*/false);
+      stats.warmupQueries += stats.heuristicQueries - before;
+    }
+#endif
   }
 
   template <typename T, typename TIdx>
@@ -441,197 +431,26 @@ private:
     return L;
   }
 
-  static std::size_t bucketUp(std::size_t x) {
-    std::size_t b = SOFIEBLAS_LAYOUT_BUCKET_MIN;
-    while (b < x) b <<= 1;
-    return b;
-  }
-
-  // Time the candidates at the exact runtime shape (the buffers are only valid
-  // at that size) and return the fastest usable one.
-  cublasLtMatmulHeuristicResult_t
-  pickFastest(cublasLtMatmulDesc_t desc,
-              const std::pair<std::size_t, std::size_t> &kA,
-              const std::pair<std::size_t, std::size_t> &kB,
-              const std::pair<std::size_t, std::size_t> &kC,
-              std::vector<cublasLtMatmulHeuristicResult_t> &cand, int got,
-              float alpha, const float *A, const float *B,
-              float beta, const float *D_in, float *C_out) {
-    auto lA = stampLayout(ROLE_A, kA);
-    auto lB = stampLayout(ROLE_B, kB);
-    auto lC = stampLayout(ROLE_C, kC);
-
-    cudaEvent_t e0, e1;
-    CHECK_CUDA(cudaEventCreate(&e0));
-    CHECK_CUDA(cudaEventCreate(&e1));
-
-    const int reps = 3;
-    int   best  = -1;
-    float bestMs = 0.f;
-    for (int i = 0; i < got; ++i) {
-      cublasLtMatmulHeuristicResult_t chk{};
-      if (cublasLtMatmulAlgoCheck(ltHandle, desc, lA, lB, lC, lC,
-                                  &cand[i].algo, &chk) != CUBLAS_STATUS_SUCCESS)
-        continue;
-      if (chk.workspaceSize > workspaceSize)
-        continue;
-
-      auto run = [&] {
-        CHECK_CUBLAS(cublasLtMatmul(ltHandle, desc, &alpha, A, lA, B, lB,
-                                    &beta, D_in, lC, C_out, lC,
-                                    &cand[i].algo, d_workspace, workspaceSize,
-                                    stream));
-      };
-      run();
-      CHECK_CUDA(cudaEventRecord(e0, stream));
-      for (int r = 0; r < reps; ++r) run();
-      CHECK_CUDA(cudaEventRecord(e1, stream));
-      CHECK_CUDA(cudaEventSynchronize(e1));
-      stats.tuningRuns += reps + 1;
-
-      float ms = 0.f;
-      CHECK_CUDA(cudaEventElapsedTime(&ms, e0, e1));
-      if (best < 0 || ms < bestMs) { best = i; bestMs = ms; }
-    }
-
-    CHECK_CUDA(cudaEventDestroy(e0));
-    CHECK_CUDA(cudaEventDestroy(e1));
-    return cand[best < 0 ? 0 : best];
-  }
-
-  // Query the heuristic at the tuning dims, then optionally time candidates at
-  // the exact runtime shape and keep the fastest. Tuning dims only reach
-  // host-side descriptors, so they may exceed what the buffers hold.
-  AlgoProfile makeProfile(cublasLtMatmulDesc_t desc,
-                          const std::pair<std::size_t, std::size_t> &tA,
-                          const std::pair<std::size_t, std::size_t> &tB,
-                          const std::pair<std::size_t, std::size_t> &tC,
-                          const std::pair<std::size_t, std::size_t> &kA,
-                          const std::pair<std::size_t, std::size_t> &kB,
-                          const std::pair<std::size_t, std::size_t> &kC,
-                          float alpha, const float *A, const float *B,
-                          float beta, const float *D_in, float *C_out) {
-    auto lA = stampLayout(ROLE_A, tA);
-    auto lB = stampLayout(ROLE_B, tB);
-    auto lC = stampLayout(ROLE_C, tC);
-
-    const int want = SOFIEBLAS_LAYOUT_TUNE_CANDIDATES;
-    std::vector<cublasLtMatmulHeuristicResult_t> cand(want);
-    int got = 0;
-    CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(
-        ltHandle, desc, lA, lB, lC, lC, preference, want, cand.data(), &got));
-    ++stats.heuristicQueries;
-    if (got == 0) {
-      std::cerr << "[sofieBLAS] No cuBLASLt algorithm for "
-                << tA.first << "x" << tA.second << " * "
-                << tB.first << "x" << tB.second << "\n";
-      exit(EXIT_FAILURE);
-    }
-
-    AlgoProfile p{};
-    // beta != 0 accumulates, so a candidate cannot be run more than once.
-    p.tuned = (want > 1 && got > 1 && beta == 0.0f)
-                  ? pickFastest(desc, kA, kB, kC, cand, got,
-                                alpha, A, B, beta, D_in, C_out)
-                  : cand[0];
-#if SOFIEBLAS_LAYOUT_VALIDATE == 1
-    p.usable = checkAlgo(desc, p.tuned.algo, kA, kB, kC);
-    if (!p.usable) ++stats.algoCheckRejects;
-#endif
-    return p;
-  }
-
-  cublasLtMatmulHeuristicResult_t
-  resolveProfiled(cublasLtMatmulDesc_t desc, cublasOperation_t transA,
-                  cublasOperation_t transB, cublasLtEpilogue_t epilogue,
-                  const std::pair<std::size_t, std::size_t> &kA,
-                  const std::pair<std::size_t, std::size_t> &kB,
-                  const std::pair<std::size_t, std::size_t> &kC,
-                  float alpha, const float *A, const float *B,
-                  float beta, const float *D_in, float *C_out) {
-    const DescKey dk{(int)transA, (int)transB, (int)epilogue};
-    AlgoProfile *pp = nullptr;
-
-#if SOFIEBLAS_LAYOUT_BUCKET_MODE == 1
-    // Tune at the tightest declared envelope covering this call. Tightest
-    // matters: several envelopes may dominate a small shape, but only the
-    // call site's own matches its weight dims exactly.
+  // Tightest declared envelope covering this call, or null if none does.
+  // Tightest matters: several envelopes may cover a small shape, but only the
+  // call site's own matches its weight dims exactly and so has zero excess
+  // on those axes.
+  const ShapeEnvelope *
+  findEnvelope(const std::pair<std::size_t, std::size_t> &kA,
+               const std::pair<std::size_t, std::size_t> &kB,
+               const std::pair<std::size_t, std::size_t> &kC) const {
+    const ShapeEnvelope *best = nullptr;
     std::size_t bestExcess = std::numeric_limits<std::size_t>::max();
-    const ShapeEnvelope *env = nullptr;
     for (const auto &e : envelopes) {
       if (e.rowsA < kA.first || e.colsA < kA.second ||
           e.rowsB < kB.first || e.colsB < kB.second ||
-          e.rowsC < kC.first || e.colsC < kC.second) continue;
+          e.rowsC < kC.first || e.colsC < kC.second)
+        continue;
       const std::size_t ex = (e.rowsA - kA.first) + (e.colsA - kA.second) +
                              (e.rowsB - kB.first) + (e.colsB - kB.second);
-      if (ex < bestExcess) { bestExcess = ex; env = &e; }
+      if (ex < bestExcess) { bestExcess = ex; best = &e; }
     }
-    // No declared envelope covers this call, so tune at the call itself.
-    const std::pair<std::size_t, std::size_t>
-        tA = env ? std::make_pair(env->rowsA, env->colsA) : kA,
-        tB = env ? std::make_pair(env->rowsB, env->colsB) : kB,
-        tC = env ? std::make_pair(env->rowsC, env->colsC) : kC;
-    const AlgoKey bkey{dk, tA.first, tA.second, tB.first, tB.second};
-    auto it = profileStore.find(bkey);
-    if (it == profileStore.end())
-      it = profileStore
-               .emplace(bkey, makeProfile(desc, tA, tB, tC, kA, kB, kC,
-                                          alpha, A, B, beta, D_in, C_out))
-               .first;
-    pp = &it->second;
-#else
-    const AlgoKey bkey{dk, bucketUp(kA.first), bucketUp(kA.second),
-                           bucketUp(kB.first), bucketUp(kB.second)};
-    auto it = profileStore.find(bkey);
-    if (it == profileStore.end()) {
-      const std::pair<std::size_t, std::size_t>
-          bA{bucketUp(kA.first), bucketUp(kA.second)},
-          bB{bucketUp(kB.first), bucketUp(kB.second)},
-          bC{bucketUp(kC.first), bucketUp(kC.second)};
-      it = profileStore
-               .emplace(bkey, makeProfile(desc, bA, bB, bC, kA, kB, kC,
-                                          alpha, A, B, beta, D_in, C_out))
-               .first;
-    }
-    pp = &it->second;
-#endif
-
-    AlgoProfile &p = *pp;
-
-#if SOFIEBLAS_LAYOUT_VALIDATE >= 2
-    const AlgoKey exact{dk, kA.first, kA.second, kB.first, kB.second};
-    if (p.haveLast && p.lastExact == exact) {
-      ++stats.memoHits;
-      return p.lastValid;
-    }
-    if (checkAlgo(desc, p.tuned.algo, kA, kB, kC)) {
-      p.lastExact = exact;
-      p.lastValid = p.tuned;
-      p.haveLast  = true;
-      return p.tuned;
-    }
-    ++stats.algoCheckRejects;
-#else
-    if (p.usable)
-      return p.tuned;
-#endif
-
-    ++stats.exactFallbacks;
-    return getOrComputeAlgo(transA, transB, epilogue, kA, kB, kC);
-  }
-
-  bool checkAlgo(cublasLtMatmulDesc_t desc, const cublasLtMatmulAlgo_t &algo,
-                 const std::pair<std::size_t, std::size_t> &kA,
-                 const std::pair<std::size_t, std::size_t> &kB,
-                 const std::pair<std::size_t, std::size_t> &kC) {
-    auto lA = stampLayout(ROLE_A, kA);
-    auto lB = stampLayout(ROLE_B, kB);
-    auto lC = stampLayout(ROLE_C, kC);
-    cublasLtMatmulHeuristicResult_t chk{};
-    const cublasStatus_t st =
-        cublasLtMatmulAlgoCheck(ltHandle, desc, lA, lB, lC, lC, &algo, &chk);
-    ++stats.algoChecks;
-    return st == CUBLAS_STATUS_SUCCESS && chk.workspaceSize <= workspaceSize;
+    return best;
   }
 
   cublasLtMatmulDesc_t &getOrCreateDesc(cublasOperation_t transA,
@@ -662,17 +481,21 @@ private:
     return descStore.at(key);
   }
 
-  cublasLtMatmulHeuristicResult_t &
+  // required=false is used by constructor warmup, which speculatively resolves
+  // epilogues the call site may never use: those may legitimately have no
+  // algorithm and must not abort.
+  cublasLtMatmulHeuristicResult_t *
   getOrComputeAlgo(cublasOperation_t transA, cublasOperation_t transB,
                    cublasLtEpilogue_t epilogue,
                    const std::pair<std::size_t, std::size_t> &kA,
                    const std::pair<std::size_t, std::size_t> &kB,
-                   const std::pair<std::size_t, std::size_t> &kC) {
+                   const std::pair<std::size_t, std::size_t> &kC,
+                   bool required = true) {
     AlgoKey key{{(int)transA, (int)transB, (int)epilogue},
                 kA.first, kA.second, kB.first, kB.second};
     auto it = algoCache.find(key);
     if (it != algoCache.end())
-      return it->second;
+      return &it->second;
 
     auto &desc = getOrCreateDesc(transA, transB, epilogue);
     auto lA = stampLayout(ROLE_A, kA);
@@ -685,6 +508,8 @@ private:
         preference, 1, &h, &returnedResults));
     ++stats.heuristicQueries;
     if (returnedResults == 0) {
+      if (!required)
+        return nullptr;
       std::cerr << "[sofieBLAS] No suitable cuBLASLt algorithm found for "
                 << "transA=" << transA << " transB=" << transB
                 << " epilogue=" << epilogue
@@ -692,8 +517,7 @@ private:
                 << " B=[" << kB.first << "x" << kB.second << "]\n";
       exit(EXIT_FAILURE);
     }
-    algoCache.emplace(key, h);
-    return algoCache.at(key);
+    return &algoCache.emplace(key, h).first->second;
   }
 
   void executeMatmul(cublasOperation_t transA, cublasOperation_t transB,
@@ -706,7 +530,6 @@ private:
                      const std::pair<std::size_t, std::size_t> &kC) {
     ++stats.matmuls;
 
-    // Descriptor first: tuning may need to run the matmul, bias included.
     auto &desc = getOrCreateDesc(transA, transB, epilogue);
     if (bias_ptr) {
       CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
@@ -715,16 +538,24 @@ private:
     }
 
 #if SOFIEBLAS_LAYOUT_PROFILE
-    cublasLtMatmulHeuristicResult_t h =
-        resolveProfiled(desc, transA, transB, epilogue, kA, kB, kC,
-                        alpha, A, B, beta, D_in, C_out);
+    // Resolve the algorithm at this call site's declared envelope, so every
+    // runtime size it produces shares one cache entry. An algorithm chosen for
+    // a larger shape stays valid at a smaller one; if cuBLASLt ever disagreed
+    // the matmul below would report it rather than compute silently wrong.
+    const ShapeEnvelope *env = findEnvelope(kA, kB, kC);
+    if (!env)
+      ++stats.envelopeMisses;
+    const std::pair<std::size_t, std::size_t>
+        aA = env ? std::make_pair(env->rowsA, env->colsA) : kA,
+        aB = env ? std::make_pair(env->rowsB, env->colsB) : kB,
+        aC = env ? std::make_pair(env->rowsC, env->colsC) : kC;
+    auto *h = getOrComputeAlgo(transA, transB, epilogue, aA, aB, aC);
 #else
-    cublasLtMatmulHeuristicResult_t h =
-        getOrComputeAlgo(transA, transB, epilogue, kA, kB, kC);
+    auto *h = getOrComputeAlgo(transA, transB, epilogue, kA, kB, kC);
 #endif
 
-    // Re-stamp the shared role layouts to this call's exact shape. Tuning and
-    // validation leave them at other sizes, so this has to happen last.
+    // Re-stamp the shared role layouts to this call's exact shape. Resolving
+    // the algorithm leaves them at the envelope size, so this happens last.
     auto lA = stampLayout(ROLE_A, kA);
     auto lB = stampLayout(ROLE_B, kB);
     auto lC = stampLayout(ROLE_C, kC);
@@ -734,7 +565,7 @@ private:
                 B, lB,
         &beta, D_in, lC,
                C_out, lC,
-        &h.algo, d_workspace, workspaceSize, stream));
+        &h->algo, d_workspace, workspaceSize, stream));
   }
 };
 
