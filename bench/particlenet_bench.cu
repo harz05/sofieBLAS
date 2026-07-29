@@ -89,5 +89,17 @@ int main(int argc, char **argv) {
               first100);
   std::printf("per-event ms: mean=%.4f p50=%.4f p95=%.4f p99=%.4f max=%.4f\n",
               total / nEvents, pct(0.50), pct(0.95), pct(0.99), srt.back());
+
+  // Separates a one-off startup cost, which lands on the first event or two,
+  // from a gradual GPU clock ramp, which decays over many events.
+  std::printf("first events ms:");
+  for (int i = 0; i < 10 && i < nEvents; ++i) std::printf(" %.3f", lat[i]);
+  std::printf("\n");
+  for (int blk = 0; blk + 100 <= nEvents && blk < 500; blk += 100) {
+    double s = 0.0;
+    for (int i = blk; i < blk + 100; ++i) s += lat[i];
+    std::printf("events %3d-%3d: %.2f ms   (steady = %.2f)\n", blk, blk + 99, s,
+                pct(0.50) * 100);
+  }
   return 0;
 }
