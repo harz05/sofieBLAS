@@ -95,8 +95,10 @@ int main(int argc, char **argv) {
   cudaGetDeviceProperties(&prop, 0);
   std::printf("device: %s  SMs=%d  cc=%d.%d\n", prop.name,
               prop.multiProcessorCount, prop.major, prop.minor);
-  std::printf("PROFILE=%d WARMUP=%d envelope_n_pf=%d sweep_n_pf=%d..%d kind=%d\n\n",
-              SOFIEBLAS_LAYOUT_PROFILE, SOFIEBLAS_LAYOUT_WARMUP, npfEnv,
+  std::printf("PROFILE=%d WARMUP=%d FREQ=%d(thr=%d) envelope_n_pf=%d "
+              "sweep_n_pf=%d..%d kind=%d\n\n",
+              SOFIEBLAS_LAYOUT_PROFILE, SOFIEBLAS_LAYOUT_WARMUP,
+              SOFIEBLAS_LAYOUT_FREQ, SOFIEBLAS_LAYOUT_FREQ_THRESHOLD, npfEnv,
               NPF_MIN, NPF_MAX, kindOnly);
 
   BlasCuda blas(queue);
@@ -184,6 +186,11 @@ int main(int argc, char **argv) {
       lat.push_back(ms);
       total += ms;
       if (e < 100) first100 += ms;
+
+#if SOFIEBLAS_LAYOUT_FREQ && SOFIEBLAS_LAYOUT_FREQ_DEFER
+      // Between events, so the resolve and its first kernel load are not timed.
+      blas.promotePending();
+#endif
     }
     const auto s1 = blas.layoutStats();
     CHECK_CUDA(cudaDeviceSynchronize());
@@ -199,10 +206,13 @@ int main(int argc, char **argv) {
                 total / nEvents, pct(0.50), pct(0.95), pct(0.99), srt.back());
     std::printf("memory MB: hostRss=%.3f growth=%.3f  gpuUsed=%.1f growth=%.1f\n",
                 rss1, rss1 - rss0, gpu1, gpu1 - gpu0);
-    std::printf("counters: matmuls=%zu heur=%zu envMisses=%zu\n",
+    std::printf("counters: matmuls=%zu heur=%zu envMisses=%zu "
+                "promotions=%zu exactHits=%zu\n",
                 s1.matmuls - s0.matmuls,
                 s1.heuristicQueries - s0.heuristicQueries,
-                s1.envelopeMisses - s0.envelopeMisses);
+                s1.envelopeMisses - s0.envelopeMisses,
+                s1.promotions - s0.promotions,
+                s1.exactHits - s0.exactHits);
   }
 
   const auto s = blas.layoutStats();

@@ -2,6 +2,7 @@
 
 #ifdef ALPAKA_ACC_GPU_CUDA_ENABLED
 
+#include <algorithm>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
@@ -92,10 +93,41 @@ struct AlgoKeyHash {
 #define SOFIEBLAS_LAYOUT_WARMUP 1
 #endif
 
+// Give a shape its own algorithm once it has been seen this many times,
+// instead of serving it from the call site envelope. Threshold is break-even:
+// a resolve costs ~12 us and saves ~1 us per call. Slots bound the table, so
+// a workload that never repeats a shape cannot grow the cache.
+#ifndef SOFIEBLAS_LAYOUT_FREQ
+#define SOFIEBLAS_LAYOUT_FREQ 0
+#endif
+
+#ifndef SOFIEBLAS_LAYOUT_FREQ_SLOTS
+#define SOFIEBLAS_LAYOUT_FREQ_SLOTS 64
+#endif
+
+#ifndef SOFIEBLAS_LAYOUT_FREQ_THRESHOLD
+#define SOFIEBLAS_LAYOUT_FREQ_THRESHOLD 16
+#endif
+
+// 1 = a shape that crosses the threshold waits for promotePending(), so the
+// resolve and its first-use kernel load stay off the inference path.
+// 0 = resolve as soon as the threshold is crossed, on whichever call it is.
+#ifndef SOFIEBLAS_LAYOUT_FREQ_DEFER
+#define SOFIEBLAS_LAYOUT_FREQ_DEFER 1
+#endif
+
 // A call site's maximum shape, as declared by addLayoutConfig from the
 // generated Session constructor.
 struct ShapeEnvelope {
   std::size_t rowsA, colsA, rowsB, colsB, rowsC, colsC;
+};
+
+// Occurrences of one exact shape, with the dims needed to resolve it later.
+struct ShapeCount {
+  AlgoKey     key;
+  std::pair<std::size_t, std::size_t> kA, kB, kC;
+  std::size_t count    = 0;
+  bool        promoted = false;
 };
 
 struct LayoutStats {
@@ -105,6 +137,8 @@ struct LayoutStats {
   std::size_t envelopeMisses   = 0;  // calls no declared envelope covered
   std::size_t algoChecks       = 0;
   std::size_t envelopeRejects  = 0;  // envelope algorithm unusable at the call
+  std::size_t promotions       = 0;  // shapes given their own algorithm
+  std::size_t exactHits        = 0;  // calls served by a promoted algorithm
 };
 
 class BlasCuda {
@@ -130,12 +164,28 @@ class BlasCuda {
   // call-site envelopes declared by addLayoutConfig
   std::vector<ShapeEnvelope> envelopes;
 
+  // bounded occurrence table driving promotion
+  std::vector<ShapeCount> shapeCounts;
+
   LayoutStats stats;
 
 public:
   const LayoutStats &layoutStats() const { return stats; }
   std::size_t algoCacheSize()     const { return algoCache.size(); }
   std::size_t envelopeCount()     const { return envelopes.size(); }
+
+  // Resolve algorithms for shapes that have become frequent. Call between
+  // inferences so neither the search nor its first-use kernel load lands on
+  // one. Returns how many were resolved.
+  std::size_t promotePending() {
+    std::size_t n = 0;
+    for (auto &s : shapeCounts)
+      if (!s.promoted && s.count >= SOFIEBLAS_LAYOUT_FREQ_THRESHOLD) {
+        promoteShape(s);
+        ++n;
+      }
+    return n;
+  }
 
   BlasCuda(const BlasCuda &) = delete;
   BlasCuda &operator=(const BlasCuda &) = delete;
@@ -487,6 +537,44 @@ private:
     return descStore.at(key);
   }
 
+  // Resolve this shape's own algorithm into the cache the envelope entries
+  // already live in.
+  void promoteShape(ShapeCount &s) {
+    s.promoted = true;
+    ++stats.promotions;
+    getOrComputeAlgo(static_cast<cublasOperation_t>(s.key.dk.transA),
+                     static_cast<cublasOperation_t>(s.key.dk.transB),
+                     static_cast<cublasLtEpilogue_t>(s.key.dk.epilogue),
+                     s.kA, s.kB, s.kC);
+  }
+
+  // Count an occurrence of this shape. When the table is full the least-seen
+  // entry is replaced, carrying its count forward so frequent shapes
+  // accumulate instead of the table thrashing on whatever arrived first.
+  void noteShape(const AlgoKey &exact,
+                 const std::pair<std::size_t, std::size_t> &kA,
+                 const std::pair<std::size_t, std::size_t> &kB,
+                 const std::pair<std::size_t, std::size_t> &kC) {
+    for (auto &s : shapeCounts) {
+      if (!(s.key == exact)) continue;
+      ++s.count;
+#if !SOFIEBLAS_LAYOUT_FREQ_DEFER
+      if (!s.promoted && s.count >= SOFIEBLAS_LAYOUT_FREQ_THRESHOLD)
+        promoteShape(s);
+#endif
+      return;
+    }
+
+    if (shapeCounts.size() < SOFIEBLAS_LAYOUT_FREQ_SLOTS) {
+      shapeCounts.push_back({exact, kA, kB, kC, 1, false});
+      return;
+    }
+    auto min = std::min_element(
+        shapeCounts.begin(), shapeCounts.end(),
+        [](const ShapeCount &a, const ShapeCount &b) { return a.count < b.count; });
+    *min = ShapeCount{exact, kA, kB, kC, min->count + 1, false};
+  }
+
   // Whether an algorithm can actually run this shape. cuBLASLt rejects some
   // combinations, so an algorithm resolved at a call site's envelope is not
   // guaranteed to work at every smaller shape it serves.
@@ -561,25 +649,41 @@ private:
     }
 
 #if SOFIEBLAS_LAYOUT_PROFILE
-    // Resolve the algorithm at this call site's declared envelope, so every
-    // runtime size it produces shares one cache entry. An algorithm chosen for
-    // a larger shape stays valid at a smaller one; if cuBLASLt ever disagreed
-    // the matmul below would report it rather than compute silently wrong.
-    const ShapeEnvelope *env = findEnvelope(kA, kB, kC);
-    if (!env)
-      ++stats.envelopeMisses;
-    const std::pair<std::size_t, std::size_t>
-        aA = env ? std::make_pair(env->rowsA, env->colsA) : kA,
-        aB = env ? std::make_pair(env->rowsB, env->colsB) : kB,
-        aC = env ? std::make_pair(env->rowsC, env->colsC) : kC;
-    auto *h = getOrComputeAlgo(transA, transB, epilogue, aA, aB, aC);
+    cublasLtMatmulHeuristicResult_t *h = nullptr;
 
-    // Fall back to resolving at the exact shape when the envelope's algorithm
-    // cannot run it. cuBLASLt returns CUBLAS_STATUS_NOT_SUPPORTED for at least
-    // some shape/algorithm combinations; m=1 was the first observed.
-    if (env && !algoUsable(desc, h->algo, kA, kB, kC)) {
-      ++stats.envelopeRejects;
-      h = getOrComputeAlgo(transA, transB, epilogue, kA, kB, kC);
+#if SOFIEBLAS_LAYOUT_FREQ
+    const AlgoKey exact{{(int)transA, (int)transB, (int)epilogue},
+                        kA.first, kA.second, kB.first, kB.second};
+    // A shape promoted earlier already has its own entry in the same cache.
+    auto ex = algoCache.find(exact);
+    if (ex != algoCache.end()) {
+      ++stats.exactHits;
+      h = &ex->second;
+    }
+#endif
+
+    if (!h) {
+      // Resolve at this call site's declared envelope, so every runtime size it
+      // produces shares one cache entry.
+      const ShapeEnvelope *env = findEnvelope(kA, kB, kC);
+      if (!env)
+        ++stats.envelopeMisses;
+      const std::pair<std::size_t, std::size_t>
+          aA = env ? std::make_pair(env->rowsA, env->colsA) : kA,
+          aB = env ? std::make_pair(env->rowsB, env->colsB) : kB,
+          aC = env ? std::make_pair(env->rowsC, env->colsC) : kC;
+      h = getOrComputeAlgo(transA, transB, epilogue, aA, aB, aC);
+
+      // Fall back to the exact shape when the envelope's algorithm cannot run
+      // it. cuBLASLt returns CUBLAS_STATUS_NOT_SUPPORTED for at least some
+      // shape/algorithm combinations; m=1 was the first observed.
+      if (env && !algoUsable(desc, h->algo, kA, kB, kC)) {
+        ++stats.envelopeRejects;
+        h = getOrComputeAlgo(transA, transB, epilogue, kA, kB, kC);
+      }
+#if SOFIEBLAS_LAYOUT_FREQ
+      noteShape(exact, kA, kB, kC);
+#endif
     }
 #else
     auto *h = getOrComputeAlgo(transA, transB, epilogue, kA, kB, kC);
