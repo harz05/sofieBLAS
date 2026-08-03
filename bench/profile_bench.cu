@@ -55,6 +55,11 @@ static const int NSV = 10, NPF_MIN = 20, NPF_MAX = 120;
 static const int MAXM = (NPF_MAX + NSV) * 8;
 static const int MAXK = 288, MAXN = 256;
 
+static int gKindOnly = -1;
+static bool useCall(int c) {
+  return gKindOnly < 0 || static_cast<int>(kCalls[c].kind) == gKindOnly;
+}
+
 static int mFor(MKind kind, int npf) {
   switch (kind) {
     case M_NPF:  return npf;
@@ -78,6 +83,10 @@ int main(int argc, char **argv) {
   // Envelope declared at this n_pf. Below NPF_MAX it leaves the larger sweep
   // sizes uncovered, which exercises the fallback path.
   const int npfEnv = (argc > 2) ? std::atoi(argv[2]) : NPF_MAX;
+  // Restrict to call sites of one kind, so a regression concentrated in one
+  // group is not diluted by the rest. -1 runs all of them.
+  const int kindOnly = (argc > 3) ? std::atoi(argv[3]) : -1;
+  gKindOnly = kindOnly;
   alpaka::PlatformCudaRt plat{};
   auto device = alpaka::getDevByIdx(plat, 0u);
   alpaka::Queue<alpaka::DevCudaRt, alpaka::NonBlocking> queue(device);
@@ -86,15 +95,16 @@ int main(int argc, char **argv) {
   cudaGetDeviceProperties(&prop, 0);
   std::printf("device: %s  SMs=%d  cc=%d.%d\n", prop.name,
               prop.multiProcessorCount, prop.major, prop.minor);
-  std::printf("PROFILE=%d WARMUP=%d envelope_n_pf=%d sweep_n_pf=%d..%d\n\n",
+  std::printf("PROFILE=%d WARMUP=%d envelope_n_pf=%d sweep_n_pf=%d..%d kind=%d\n\n",
               SOFIEBLAS_LAYOUT_PROFILE, SOFIEBLAS_LAYOUT_WARMUP, npfEnv,
-              NPF_MIN, NPF_MAX);
+              NPF_MIN, NPF_MAX, kindOnly);
 
   BlasCuda blas(queue);
 
   // Declare each call site's envelope, as the generated Session constructor
   // does with its own n_pf argument.
   for (int c = 0; c < kNCalls; ++c) {
+    if (!useCall(c)) continue;
     const int m = mFor(kCalls[c].kind, npfEnv);
     const int n = kCalls[c].n, k = kCalls[c].k;
     blas.addLayoutConfig(m, n, k, m, k, m, 'n', 'n');
@@ -119,6 +129,7 @@ int main(int argc, char **argv) {
     float worst = 0.f;
     const std::size_t missBefore = blas.layoutStats().envelopeMisses;
     for (int c = 0; c < kNCalls; ++c) {
+      if (!useCall(c)) continue;
       const int n = kCalls[c].n, k = kCalls[c].k;
       blas.matmul('n', 'n', (unsigned)m, (unsigned)n, (unsigned)k, 1.0f,
                   (const float *)dA, (const float *)dB, 0.0f, dC);
@@ -160,6 +171,7 @@ int main(int argc, char **argv) {
       CHECK_CUDA(cudaDeviceSynchronize());
       const auto t0 = std::chrono::high_resolution_clock::now();
       for (int c = 0; c < kNCalls; ++c) {
+        if (!useCall(c)) continue;
         const int m = mFor(kCalls[c].kind, npf);
         blas.matmul('n', 'n', (unsigned)m, (unsigned)kCalls[c].n,
                     (unsigned)kCalls[c].k, 1.0f,
