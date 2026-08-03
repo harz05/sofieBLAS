@@ -567,6 +567,78 @@ static void runCudaTests() {
   }
 }
 
+// One instance used at many sizes, which is what a dynamic-shape model does.
+// earlier, any size other than the one registered at construction threw std::out_of_range from the layout lookup
+// so this is the case the rest of the suite never covered.
+static void runDynamicShapeTests() {
+  std::cout << "\n=== CUDA Dynamic-Shape Tests ===\n";
+
+  alpaka::PlatformCudaRt platform{};
+  auto dev = alpaka::getDevByIdx(platform, 0u);
+  alpaka::Queue<alpaka::DevCudaRt, alpaka::NonBlocking> queue{dev};
+  sofieBLAS<alpaka::TagGpuCudaRt> blas(queue);
+
+  alpaka::PlatformCpu hostPlatform{};
+  auto hostDev = alpaka::getDevByIdx(hostPlatform, 0u);
+
+  // Buffers hold MCAP rows while the call site declares MENV, so sizes above
+  // MENV stay in bounds and exercise the path where no envelope covers them.
+  constexpr int MCAP = 96, MENV = 64, N = 3, K = 5;
+
+  auto hA = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(MCAP * K));
+  auto hB = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(K * N));
+  auto hC = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(MCAP * N));
+  float *A = alpaka::getPtrNative(hA);
+  float *B = alpaka::getPtrNative(hB);
+  float *C = alpaka::getPtrNative(hC);
+  fillSeq(A, MCAP * K, 0.5f, 0.25f);
+  fillSeq(B, K * N, 1.f, 0.5f);
+
+  auto dA = alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(MCAP * K));
+  auto dB = alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(K * N));
+  auto dC = alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(MCAP * N));
+  alpaka::memcpy(queue, dA, hA);
+  alpaka::memcpy(queue, dB, hB);
+  alpaka::wait(queue);
+
+  // Declare the call site's largest shape, as a generated Session constructor
+  // does with its own arguments.
+  blas.addLayoutConfig(MENV, N, K, ldaFor('N', MENV, K), ldbFor('N', K, N),
+                       MENV, 'N', 'N');
+
+  std::vector<float> ref;
+  auto runAt = [&](int m, const std::string &name) {
+    ref.assign(static_cast<std::size_t>(m) * N, 0.f);
+    refMatmul(ref.data(), A, B, m, N, K, 1.f, 0.f, false, false);
+    blas.matmul('N', 'N', static_cast<unsigned>(m), static_cast<unsigned>(N),
+                static_cast<unsigned>(K), 1.f, dA, dB, 0.f, dC);
+    alpaka::memcpy(queue, hC, dC);
+    alpaka::wait(queue);
+    checkClose(C, ref.data(), m * N, name);
+  };
+
+  // At, below and above the declared envelope, all on one instance.
+  for (int m : {MENV, 37, 8, 51, 1, MENV, MCAP})
+    runAt(m, "cuda::dynamic m=" + std::to_string(m));
+
+  // Seeing more sizes must not grow the algorithm cache. A revert to keying
+  // by shape would still pass every check above and fail only this one.
+  const std::size_t before = blas.algoCacheSize();
+  for (int m = 2; m <= MENV; ++m)
+    blas.matmul('N', 'N', static_cast<unsigned>(m), static_cast<unsigned>(N),
+                static_cast<unsigned>(K), 1.f, dA, dB, 0.f, dC);
+  alpaka::wait(queue);
+  const std::size_t after = blas.algoCacheSize();
+  if (after == before) {
+    std::cout << "  PASS  cuda::cache bounded (" << after << " entries over "
+              << (MENV - 1) << " sizes)\n";
+  } else {
+    std::cerr << "  FAIL [cuda::cache bounded] grew " << before << " -> "
+              << after << "\n";
+    ++gFailures;
+  }
+}
+
 #endif // ALPAKA_ACC_GPU_CUDA_ENABLED
 
 // ---------------------------------------------------------------------------
@@ -579,6 +651,7 @@ int main() {
 #endif
 #ifdef ALPAKA_ACC_GPU_CUDA_ENABLED
   runCudaTests();
+  runDynamicShapeTests();
 #endif
 
   std::cout << "\n";
