@@ -103,6 +103,8 @@ struct LayoutStats {
   std::size_t heuristicQueries = 0;
   std::size_t warmupQueries    = 0;  // of which resolved in the constructor
   std::size_t envelopeMisses   = 0;  // calls no declared envelope covered
+  std::size_t algoChecks       = 0;
+  std::size_t envelopeRejects  = 0;  // envelope algorithm unusable at the call
 };
 
 class BlasCuda {
@@ -485,6 +487,23 @@ private:
     return descStore.at(key);
   }
 
+  // Whether an algorithm can actually run this shape. cuBLASLt rejects some
+  // combinations, so an algorithm resolved at a call site's envelope is not
+  // guaranteed to work at every smaller shape it serves.
+  bool algoUsable(cublasLtMatmulDesc_t desc, const cublasLtMatmulAlgo_t &algo,
+                  const std::pair<std::size_t, std::size_t> &kA,
+                  const std::pair<std::size_t, std::size_t> &kB,
+                  const std::pair<std::size_t, std::size_t> &kC) {
+    auto lA = stampLayout(ROLE_A, kA);
+    auto lB = stampLayout(ROLE_B, kB);
+    auto lC = stampLayout(ROLE_C, kC);
+    cublasLtMatmulHeuristicResult_t chk{};
+    ++stats.algoChecks;
+    return cublasLtMatmulAlgoCheck(ltHandle, desc, lA, lB, lC, lC, &algo,
+                                   &chk) == CUBLAS_STATUS_SUCCESS &&
+           chk.workspaceSize <= workspaceSize;
+  }
+
   // required=false is used by constructor warmup, which speculatively resolves
   // epilogues the call site may never use: those may legitimately have no
   // algorithm and must not abort.
@@ -554,6 +573,14 @@ private:
         aB = env ? std::make_pair(env->rowsB, env->colsB) : kB,
         aC = env ? std::make_pair(env->rowsC, env->colsC) : kC;
     auto *h = getOrComputeAlgo(transA, transB, epilogue, aA, aB, aC);
+
+    // Fall back to resolving at the exact shape when the envelope's algorithm
+    // cannot run it. cuBLASLt returns CUBLAS_STATUS_NOT_SUPPORTED for at least
+    // some shape/algorithm combinations; m=1 was the first observed.
+    if (env && !algoUsable(desc, h->algo, kA, kB, kC)) {
+      ++stats.envelopeRejects;
+      h = getOrComputeAlgo(transA, transB, epilogue, kA, kB, kC);
+    }
 #else
     auto *h = getOrComputeAlgo(transA, transB, epilogue, kA, kB, kC);
 #endif

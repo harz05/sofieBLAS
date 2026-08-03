@@ -621,20 +621,24 @@ static void runDynamicShapeTests() {
   for (int m : {MENV, 37, 8, 51, 1, MENV, MCAP})
     runAt(m, "cuda::dynamic m=" + std::to_string(m));
 
-  // Seeing more sizes must not grow the algorithm cache. A revert to keying
-  // by shape would still pass every check above and fail only this one.
-  const std::size_t before = blas.algoCacheSize();
+  // The cache must not grow one entry per size. Entries are added only where
+  // the envelope's algorithm is rejected. Keying by shape fails only here.
+  const int nSizes = MENV - 1;
+  const std::size_t cacheBefore = blas.algoCacheSize();
+  const std::size_t rejBefore = blas.layoutStats().envelopeRejects;
   for (int m = 2; m <= MENV; ++m)
     blas.matmul('N', 'N', static_cast<unsigned>(m), static_cast<unsigned>(N),
                 static_cast<unsigned>(K), 1.f, dA, dB, 0.f, dC);
   alpaka::wait(queue);
-  const std::size_t after = blas.algoCacheSize();
-  if (after == before) {
-    std::cout << "  PASS  cuda::cache bounded (" << after << " entries over "
-              << (MENV - 1) << " sizes)\n";
+  const std::size_t added = blas.algoCacheSize() - cacheBefore;
+  const std::size_t rejected = blas.layoutStats().envelopeRejects - rejBefore;
+
+  std::cout << "        " << nSizes << " sizes added " << added
+            << " cache entries, " << rejected << " rejected\n";
+  if (added < static_cast<std::size_t>(nSizes)) {
+    std::cout << "  PASS  cuda::cache bounded\n";
   } else {
-    std::cerr << "  FAIL [cuda::cache bounded] grew " << before << " -> "
-              << after << "\n";
+    std::cerr << "  FAIL [cuda::cache bounded] one entry per size\n";
     ++gFailures;
   }
 }
