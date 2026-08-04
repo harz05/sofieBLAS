@@ -4,6 +4,7 @@
 
 #include <alpaka/alpaka.hpp>
 #include <cuda_runtime.h>
+#include <unistd.h>
 
 #include "particle-net_FromONNX_GPU_ALPAKA.hxx"
 
@@ -12,6 +13,21 @@
 #include <cstdio>
 #include <random>
 #include <vector>
+
+static double hostRssMB() {
+  FILE *f = std::fopen("/proc/self/statm", "r");
+  if (!f) return 0.0;
+  long total = 0, rss = 0;
+  if (std::fscanf(f, "%ld %ld", &total, &rss) != 2) rss = 0;
+  std::fclose(f);
+  return (double)rss * (double)sysconf(_SC_PAGESIZE) / (1024.0 * 1024.0);
+}
+
+static double gpuUsedMB() {
+  size_t freeB = 0, totalB = 0;
+  cudaMemGetInfo(&freeB, &totalB);
+  return (double)(totalB - freeB) / (1024.0 * 1024.0);
+}
 
 using Idx = std::size_t;
 using Dim = alpaka::DimInt<1>;
@@ -67,6 +83,8 @@ int main(int argc, char **argv) {
   std::vector<double> lat;
   lat.reserve(nEvents);
   double total = 0.0, first100 = 0.0;
+  cudaDeviceSynchronize();
+  const double rss0 = hostRssMB(), gpu0 = gpuUsedMB();
 
   for (int e = 0; e < nEvents; ++e) {
     const size_t npf = (size_t)pick(r);
@@ -81,6 +99,9 @@ int main(int argc, char **argv) {
     if (e < 100) first100 += ms;
   }
 
+  cudaDeviceSynchronize();
+  const double rss1 = hostRssMB(), gpu1 = gpuUsedMB();
+
   std::vector<double> srt = lat;
   std::sort(srt.begin(), srt.end());
   auto pct = [&](double p) { return srt[(size_t)(p * (srt.size() - 1))]; };
@@ -89,6 +110,8 @@ int main(int argc, char **argv) {
               first100);
   std::printf("per-event ms: mean=%.4f p50=%.4f p95=%.4f p99=%.4f max=%.4f\n",
               total / nEvents, pct(0.50), pct(0.95), pct(0.99), srt.back());
+  std::printf("memory MB: hostRss=%.3f growth=%.3f  gpuUsed=%.1f growth=%.1f\n",
+              rss1, rss1 - rss0, gpu1, gpu1 - gpu0);
 
   // Separates a one-off startup cost, which lands on the first event or two,
   // from a gradual GPU clock ramp, which decays over many events.
