@@ -643,6 +643,38 @@ static void runDynamicShapeTests() {
     ++gFailures;
   }
 
+  // With a limit set, shapes above the envelope are resolved individually and
+  // the cache must stay at the limit rather than growing per shape.
+  {
+    sofieBLAS<alpaka::TagGpuCudaRt> capped(queue, 8);
+    capped.addLayoutConfig(MENV, N, K, ldaFor('N', MENV, K), ldbFor('N', K, N),
+                           MENV, 'N', 'N');
+    std::vector<float> cref;
+    float worst = 0.f;
+    for (int m = MENV + 1; m <= MCAP; ++m) {
+      cref.assign(static_cast<std::size_t>(m) * N, 0.f);
+      refMatmul(cref.data(), A, B, m, N, K, 1.f, 0.f, false, false);
+      capped.matmul('N', 'N', static_cast<unsigned>(m), static_cast<unsigned>(N),
+                    static_cast<unsigned>(K), 1.f, dA, dB, 0.f, dC);
+      alpaka::memcpy(queue, hC, dC);
+      alpaka::wait(queue);
+      for (std::size_t i = 0; i < cref.size(); ++i)
+        worst = std::max(worst, std::abs(C[i] - cref[i]));
+    }
+    std::cout << "        limit=8: " << capped.algoCacheSize() << " entries, "
+              << capped.layoutStats().evictions << " evictions over "
+              << (MCAP - MENV) << " above-envelope sizes, worst err " << worst
+              << "\n";
+    if (capped.algoCacheSize() <= 8 && worst < 1e-3f) {
+      std::cout << "  PASS  cuda::cache limit honoured\n";
+    } else {
+      std::cerr << "  FAIL [cuda::cache limit honoured] "
+                << capped.algoCacheSize() << " entries, worst err " << worst
+                << "\n";
+      ++gFailures;
+    }
+  }
+
   // The constructor resolves every declared envelope, so a size it covers must
   // not trigger a search. Only a rejected envelope algorithm may.
   const std::size_t searched =
