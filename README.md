@@ -101,7 +101,7 @@ The GPU backends (`BlasCuda`, `BlasHip`) additionally expose
 - `gemmStridedBatched` for batched gemm operations through strides
 - `addOperationConfig` that creates the matrix layouts and resolves the multiply algorithm for a call site's shape ahead of its first call (see below).
 
-## Dynamic GEMM shapes and the algorithm cache
+## GEMM call instantiation and the algorithm cache
 
 A GEMM call computes `C = alpha * op(A) * op(B) + beta * C`, where A and B are the input matrices, C the output, and `op` an optional transpose. To run one, cuBLASLt and hipBLASLt need three kinds of objects besides the data:
 
@@ -133,6 +133,7 @@ sofieBLAS<alpaka::TagGpuCudaRt> capped(queue, 32); // at most 32 entries, LRU ev
 blas.addOperationConfig(64, 3, 5, 64, 5, 64, 'N', 'N', Epilogue::Default);
 blas.matmul('N', 'N', 64, 3, 5, 1.0f, dA, dB, 0.0f, dC); // created by addOperationConfig: cache hit
 blas.matmul('N', 'N', 37, 3, 5, 1.0f, dA, dB, 0.0f, dC); // new size: created on first use
+blas.gemmrelu('N', 'N', 64, 3, 5, 1.0f, dA, dB, 0.0f, dBias, dC); // same size, other epilogue: layouts reused, descriptor and algorithm created on first use
 ```
 
 
