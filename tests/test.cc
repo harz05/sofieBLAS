@@ -393,8 +393,8 @@ static void runCudaTests() {
   };
 
   // ---- matmul NN ----
-  blas.addLayoutConfig(M, N, K, ldaFor('N', M, K), ldbFor('N', K, N), M, 'N',
-                       'N');
+  blas.addOperationConfig(M, N, K, ldaFor('N', M, K), ldbFor('N', K, N), M, 'N',
+                          'N', Epilogue::Default);
   std::fill(ref.begin(), ref.end(), 0.f);
   refMatmul(ref.data(), A, B, M, N, K, 1.f, 0.f, false, false);
   blas.matmul('N', 'N', M, N, K, 1.f, dA, dB, 0.f, dC);
@@ -409,8 +409,8 @@ static void runCudaTests() {
         alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(K * M));
     alpaka::memcpy(queue, dAt, hAt);
     alpaka::wait(queue);
-    blas.addLayoutConfig(M, N, K, ldaFor('T', M, K), ldbFor('N', K, N), M, 'T',
-                         'N');
+    blas.addOperationConfig(M, N, K, ldaFor('T', M, K), ldbFor('N', K, N), M,
+                            'T', 'N', Epilogue::Default);
     std::fill(ref.begin(), ref.end(), 0.f);
     refMatmul(ref.data(), At, B, M, N, K, 1.f, 0.f, true, false);
     blas.matmul('T', 'N', M, N, K, 1.f, dAt, dB, 0.f, dC);
@@ -426,8 +426,8 @@ static void runCudaTests() {
         alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(N * K));
     alpaka::memcpy(queue, dBt, hBt);
     alpaka::wait(queue);
-    blas.addLayoutConfig(M, N, K, ldaFor('N', M, K), ldbFor('T', K, N), M, 'N',
-                         'T');
+    blas.addOperationConfig(M, N, K, ldaFor('N', M, K), ldbFor('T', K, N), M,
+                            'N', 'T', Epilogue::Default);
     std::fill(ref.begin(), ref.end(), 0.f);
     refMatmul(ref.data(), A, Bt, M, N, K, 1.f, 0.f, false, true);
     blas.matmul('N', 'T', M, N, K, 1.f, dA, dBt, 0.f, dC);
@@ -465,8 +465,8 @@ static void runCudaTests() {
         alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(K * M));
     alpaka::memcpy(queue, dAt, hAt);
     alpaka::wait(queue);
-    blas.addLayoutConfig(M, N, K, ldaFor('T', M, K), ldbFor('N', K, N), M, 'T',
-                         'N');
+    blas.addOperationConfig(M, N, K, ldaFor('T', M, K), ldbFor('N', K, N), M,
+                            'T', 'N', Epilogue::Bias);
     std::fill(ref.begin(), ref.end(), 0.f);
     refGemm(ref.data(), At, B, bias, M, N, K, 1.f, 0.f, true, false);
     blas.gemm('T', 'N', M, N, K, 1.f, dAt, dB, 0.f, dBias, dC);
@@ -494,7 +494,7 @@ static void runCudaTests() {
     alpaka::memcpy(queue, dBp, hBp);
     alpaka::memcpy(queue, dBiasz, hBiasz);
     alpaka::wait(queue);
-    blas.addLayoutConfig(M, N, K, M, K, M, 'N', 'N');
+    blas.addOperationConfig(M, N, K, M, K, M, 'N', 'N', Epilogue::ReluBias);
     std::fill(ref.begin(), ref.end(), 0.f);
     refGemmRelu(ref.data(), Ap, Bp, alpaka::getPtrNative(hBiasz), M, N, K, 1.f,
                 0.f, false, false);
@@ -559,6 +559,97 @@ static void runCudaTests() {
   }
 }
 
+static void runDynamicShapeTests() {
+  std::cout << "\n=== CUDA Dynamic-Shape Tests ===\n";
+
+  alpaka::PlatformCudaRt platform{};
+  auto dev = alpaka::getDevByIdx(platform, 0u);
+  alpaka::Queue<alpaka::DevCudaRt, alpaka::NonBlocking> queue{dev};
+
+  alpaka::PlatformCpu hostPlatform{};
+  auto hostDev = alpaka::getDevByIdx(hostPlatform, 0u);
+
+  // M0 is the construction-time size given to addOperationConfig; the buffers
+  // hold MCAP rows so sizes above M0 are exercised too.
+  constexpr int MCAP = 96, M0 = 64, N = 3, K = 5;
+
+  auto hA = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(MCAP * K));
+  auto hB = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(K * N));
+  auto hC = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(MCAP * N));
+  float *A = alpaka::getPtrNative(hA);
+  float *B = alpaka::getPtrNative(hB);
+  float *C = alpaka::getPtrNative(hC);
+  fillSeq(A, MCAP * K, 0.5f, 0.25f);
+  fillSeq(B, K * N, 1.f, 0.5f);
+
+  auto dA =
+      alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(MCAP * K));
+  auto dB = alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(K * N));
+  auto dC =
+      alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(MCAP * N));
+  alpaka::memcpy(queue, dA, hA);
+  alpaka::memcpy(queue, dB, hB);
+  alpaka::wait(queue);
+
+  // One instance serving sizes never passed to addOperationConfig (issue #10),
+  // including m=1 and a size above the construction-time one.
+  sofieBLAS<alpaka::TagGpuCudaRt> blas(queue);
+  blas.addOperationConfig(M0, N, K, ldaFor('N', M0, K), ldbFor('N', K, N), M0,
+                          'N', 'N', Epilogue::Default);
+
+  std::vector<float> ref;
+  auto runAt = [&](int m, const std::string &name) {
+    ref.assign(static_cast<std::size_t>(m) * N, 0.f);
+    refMatmul(ref.data(), A, B, m, N, K, 1.f, 0.f, false, false);
+    blas.matmul('N', 'N', static_cast<unsigned>(m), static_cast<unsigned>(N),
+                static_cast<unsigned>(K), 1.f, dA, dB, 0.f, dC);
+    alpaka::memcpy(queue, hC, dC);
+    alpaka::wait(queue);
+    checkClose(C, ref.data(), m * N, name);
+  };
+
+  for (int m : {M0, 37, 8, 51, 1, M0, MCAP})
+    runAt(m, "cuda::dynamic m=" + std::to_string(m));
+
+  // Generated code calls the raw-pointer overloads; one call keeps them
+  // compiled and resolving to the right overload.
+  ref.assign(static_cast<std::size_t>(45) * N, 0.f);
+  refMatmul(ref.data(), A, B, 45, N, K, 1.f, 0.f, false, false);
+  blas.matmul('N', 'N', 45u, static_cast<unsigned>(N), static_cast<unsigned>(K),
+              1.f, alpaka::getPtrNative(dA), alpaka::getPtrNative(dB), 0.f,
+              alpaka::getPtrNative(dC));
+  alpaka::memcpy(queue, hC, dC);
+  alpaka::wait(queue);
+  checkClose(C, ref.data(), 45 * N, "cuda::dynamic raw pointers m=45");
+
+  // 32 distinct sizes through a cache limited to 8 entries.
+  {
+    sofieBLAS<alpaka::TagGpuCudaRt> capped(queue, 8);
+    capped.addOperationConfig(M0, N, K, ldaFor('N', M0, K), ldbFor('N', K, N),
+                              M0, 'N', 'N', Epilogue::Default);
+    float worst = 0.f;
+    for (int m = M0 + 1; m <= MCAP; ++m) {
+      ref.assign(static_cast<std::size_t>(m) * N, 0.f);
+      refMatmul(ref.data(), A, B, m, N, K, 1.f, 0.f, false, false);
+      capped.matmul('N', 'N', static_cast<unsigned>(m),
+                    static_cast<unsigned>(N), static_cast<unsigned>(K), 1.f, dA,
+                    dB, 0.f, dC);
+      alpaka::memcpy(queue, hC, dC);
+      alpaka::wait(queue);
+      for (std::size_t i = 0; i < ref.size(); ++i)
+        worst = std::max(worst, std::abs(C[i] - ref[i]));
+    }
+    if (capped.algoCacheSize() <= 8 && worst < 1e-3f) {
+      std::cout << "  PASS  cuda::cache limit honoured\n";
+    } else {
+      std::cerr << "  FAIL [cuda::cache limit honoured] "
+                << capped.algoCacheSize() << " entries, worst err " << worst
+                << "\n";
+      ++gFailures;
+    }
+  }
+}
+
 #endif // ALPAKA_ACC_GPU_CUDA_ENABLED
 
 // ---------------------------------------------------------------------------
@@ -614,8 +705,8 @@ static void runHipTests() {
   };
 
   // ---- matmul NN ----
-  blas.addLayoutConfig(M, N, K, ldaFor('N', M, K), ldbFor('N', K, N), M, 'N',
-                       'N');
+  blas.addOperationConfig(M, N, K, ldaFor('N', M, K), ldbFor('N', K, N), M, 'N',
+                          'N', Epilogue::Default);
   std::fill(ref.begin(), ref.end(), 0.f);
   refMatmul(ref.data(), A, B, M, N, K, 1.f, 0.f, false, false);
   blas.matmul('N', 'N', M, N, K, 1.f, dA, dB, 0.f, dC);
@@ -630,8 +721,8 @@ static void runHipTests() {
         alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(K * M));
     alpaka::memcpy(queue, dAt, hAt);
     alpaka::wait(queue);
-    blas.addLayoutConfig(M, N, K, ldaFor('T', M, K), ldbFor('N', K, N), M, 'T',
-                         'N');
+    blas.addOperationConfig(M, N, K, ldaFor('T', M, K), ldbFor('N', K, N), M,
+                            'T', 'N', Epilogue::Default);
     std::fill(ref.begin(), ref.end(), 0.f);
     refMatmul(ref.data(), At, B, M, N, K, 1.f, 0.f, true, false);
     blas.matmul('T', 'N', M, N, K, 1.f, dAt, dB, 0.f, dC);
@@ -647,8 +738,8 @@ static void runHipTests() {
         alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(N * K));
     alpaka::memcpy(queue, dBt, hBt);
     alpaka::wait(queue);
-    blas.addLayoutConfig(M, N, K, ldaFor('N', M, K), ldbFor('T', K, N), M, 'N',
-                         'T');
+    blas.addOperationConfig(M, N, K, ldaFor('N', M, K), ldbFor('T', K, N), M,
+                            'N', 'T', Epilogue::Default);
     std::fill(ref.begin(), ref.end(), 0.f);
     refMatmul(ref.data(), A, Bt, M, N, K, 1.f, 0.f, false, true);
     blas.matmul('N', 'T', M, N, K, 1.f, dA, dBt, 0.f, dC);
@@ -686,8 +777,8 @@ static void runHipTests() {
         alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(K * M));
     alpaka::memcpy(queue, dAt, hAt);
     alpaka::wait(queue);
-    blas.addLayoutConfig(M, N, K, ldaFor('T', M, K), ldbFor('N', K, N), M, 'T',
-                         'N');
+    blas.addOperationConfig(M, N, K, ldaFor('T', M, K), ldbFor('N', K, N), M,
+                            'T', 'N', Epilogue::Bias);
     std::fill(ref.begin(), ref.end(), 0.f);
     refGemm(ref.data(), At, B, bias, M, N, K, 1.f, 0.f, true, false);
     blas.gemm('T', 'N', M, N, K, 1.f, dAt, dB, 0.f, dBias, dC);
@@ -715,7 +806,7 @@ static void runHipTests() {
     alpaka::memcpy(queue, dBp, hBp);
     alpaka::memcpy(queue, dBiasz, hBiasz);
     alpaka::wait(queue);
-    blas.addLayoutConfig(M, N, K, M, K, M, 'N', 'N');
+    blas.addOperationConfig(M, N, K, M, K, M, 'N', 'N', Epilogue::ReluBias);
     std::fill(ref.begin(), ref.end(), 0.f);
     refGemmRelu(ref.data(), Ap, Bp, alpaka::getPtrNative(hBiasz), M, N, K, 1.f,
                 0.f, false, false);
@@ -780,6 +871,97 @@ static void runHipTests() {
   }
 }
 
+static void runHipDynamicShapeTests() {
+  std::cout << "\n=== HIP Dynamic-Shape Tests ===\n";
+
+  alpaka::PlatformHipRt platform{};
+  auto dev = alpaka::getDevByIdx(platform, 0u);
+  alpaka::Queue<alpaka::DevHipRt, alpaka::NonBlocking> queue{dev};
+
+  alpaka::PlatformCpu hostPlatform{};
+  auto hostDev = alpaka::getDevByIdx(hostPlatform, 0u);
+
+  // M0 is the construction-time size given to addOperationConfig; the buffers
+  // hold MCAP rows so sizes above M0 are exercised too.
+  constexpr int MCAP = 96, M0 = 64, N = 3, K = 5;
+
+  auto hA = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(MCAP * K));
+  auto hB = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(K * N));
+  auto hC = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(MCAP * N));
+  float *A = alpaka::getPtrNative(hA);
+  float *B = alpaka::getPtrNative(hB);
+  float *C = alpaka::getPtrNative(hC);
+  fillSeq(A, MCAP * K, 0.5f, 0.25f);
+  fillSeq(B, K * N, 1.f, 0.5f);
+
+  auto dA =
+      alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(MCAP * K));
+  auto dB = alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(K * N));
+  auto dC =
+      alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(MCAP * N));
+  alpaka::memcpy(queue, dA, hA);
+  alpaka::memcpy(queue, dB, hB);
+  alpaka::wait(queue);
+
+  // One instance serving sizes never passed to addOperationConfig (issue #10),
+  // including m=1 and a size above the construction-time one.
+  sofieBLAS<alpaka::TagGpuHipRt> blas(queue);
+  blas.addOperationConfig(M0, N, K, ldaFor('N', M0, K), ldbFor('N', K, N), M0,
+                          'N', 'N', Epilogue::Default);
+
+  std::vector<float> ref;
+  auto runAt = [&](int m, const std::string &name) {
+    ref.assign(static_cast<std::size_t>(m) * N, 0.f);
+    refMatmul(ref.data(), A, B, m, N, K, 1.f, 0.f, false, false);
+    blas.matmul('N', 'N', static_cast<unsigned>(m), static_cast<unsigned>(N),
+                static_cast<unsigned>(K), 1.f, dA, dB, 0.f, dC);
+    alpaka::memcpy(queue, hC, dC);
+    alpaka::wait(queue);
+    checkClose(C, ref.data(), m * N, name);
+  };
+
+  for (int m : {M0, 37, 8, 51, 1, M0, MCAP})
+    runAt(m, "hip::dynamic m=" + std::to_string(m));
+
+  // Generated code calls the raw-pointer overloads; one call keeps them
+  // compiled and resolving to the right overload.
+  ref.assign(static_cast<std::size_t>(45) * N, 0.f);
+  refMatmul(ref.data(), A, B, 45, N, K, 1.f, 0.f, false, false);
+  blas.matmul('N', 'N', 45u, static_cast<unsigned>(N), static_cast<unsigned>(K),
+              1.f, alpaka::getPtrNative(dA), alpaka::getPtrNative(dB), 0.f,
+              alpaka::getPtrNative(dC));
+  alpaka::memcpy(queue, hC, dC);
+  alpaka::wait(queue);
+  checkClose(C, ref.data(), 45 * N, "hip::dynamic raw pointers m=45");
+
+  // 32 distinct sizes through a cache limited to 8 entries.
+  {
+    sofieBLAS<alpaka::TagGpuHipRt> capped(queue, 8);
+    capped.addOperationConfig(M0, N, K, ldaFor('N', M0, K), ldbFor('N', K, N),
+                              M0, 'N', 'N', Epilogue::Default);
+    float worst = 0.f;
+    for (int m = M0 + 1; m <= MCAP; ++m) {
+      ref.assign(static_cast<std::size_t>(m) * N, 0.f);
+      refMatmul(ref.data(), A, B, m, N, K, 1.f, 0.f, false, false);
+      capped.matmul('N', 'N', static_cast<unsigned>(m),
+                    static_cast<unsigned>(N), static_cast<unsigned>(K), 1.f, dA,
+                    dB, 0.f, dC);
+      alpaka::memcpy(queue, hC, dC);
+      alpaka::wait(queue);
+      for (std::size_t i = 0; i < ref.size(); ++i)
+        worst = std::max(worst, std::abs(C[i] - ref[i]));
+    }
+    if (capped.algoCacheSize() <= 8 && worst < 1e-3f) {
+      std::cout << "  PASS  hip::cache limit honoured\n";
+    } else {
+      std::cerr << "  FAIL [hip::cache limit honoured] "
+                << capped.algoCacheSize() << " entries, worst err " << worst
+                << "\n";
+      ++gFailures;
+    }
+  }
+}
+
 #endif // ALPAKA_ACC_GPU_HIP_ENABLED
 
 // ---------------------------------------------------------------------------
@@ -792,9 +974,11 @@ int main() {
 #endif
 #ifdef ALPAKA_ACC_GPU_CUDA_ENABLED
   runCudaTests();
+  runDynamicShapeTests();
 #endif
 #ifdef ALPAKA_ACC_GPU_HIP_ENABLED
   runHipTests();
+  runHipDynamicShapeTests();
 #endif
 
   std::cout << "\n";

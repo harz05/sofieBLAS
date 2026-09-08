@@ -139,7 +139,7 @@ static void runCudaBench(const BenchOptions &opt) {
     alpaka::memcpy(queue, dB, hB);
     alpaka::wait(queue);
 
-    blas.addLayoutConfig(M, N, K, M, K, M, 'N', 'N');
+    blas.addOperationConfig(M, N, K, M, K, M, 'N', 'N', Epilogue::Default);
 
     for (int i = 0; i < opt.warmup; ++i)
       blas.matmul('N', 'N', M, N, K, 1.f, dA, dB, 0.f, dC);
@@ -187,7 +187,7 @@ static void runHipBench(const BenchOptions &opt) {
     alpaka::memcpy(queue, dB, hB);
     alpaka::wait(queue);
 
-    blas.addLayoutConfig(M, N, K, M, K, M, 'N', 'N');
+    blas.addOperationConfig(M, N, K, M, K, M, 'N', 'N', Epilogue::Default);
 
     for (int i = 0; i < opt.warmup; ++i)
       blas.matmul('N', 'N', M, N, K, 1.f, dA, dB, 0.f, dC);
