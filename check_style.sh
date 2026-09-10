@@ -4,11 +4,12 @@ set -e
 # Directories
 SRC_DIR="./include"
 TEST_DIR="./tests"
+BENCH_DIR="./benchmark"
 
 echo "📝 Discovering source/header files..."
 
-FILES=$(find "$SRC_DIR" "$TEST_DIR" \
-    -path "$TEST_DIR/build" -prune -o \
+FILES=$(find "$SRC_DIR" "$TEST_DIR" "$BENCH_DIR" \
+    -path "*/build" -prune -o \
     -type f \( \
         -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' -o \
         -name '*.h' -o -name '*.hpp' -o -name '*.hxx' -o -name '*.hh' \

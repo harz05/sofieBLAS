@@ -54,8 +54,8 @@ static void runGpuTests(const std::string &backend) {
   };
 
   // ---- matmul NN ----
-  blas.addLayoutConfig(M, N, K, ldaFor('N', M, K), ldbFor('N', K, N), M, 'N',
-                       'N');
+  blas.addOperationConfig(M, N, K, ldaFor('N', M, K), ldbFor('N', K, N), M, 'N',
+                          'N', Epilogue::Default);
   std::fill(ref.begin(), ref.end(), 0.f);
   refMatmul(ref.data(), A, B, M, N, K, 1.f, 0.f, false, false);
   blas.matmul('N', 'N', M, N, K, 1.f, dA, dB, 0.f, dC);
@@ -70,8 +70,8 @@ static void runGpuTests(const std::string &backend) {
         alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(K * M));
     alpaka::memcpy(queue, dAt, hAt);
     alpaka::wait(queue);
-    blas.addLayoutConfig(M, N, K, ldaFor('T', M, K), ldbFor('N', K, N), M, 'T',
-                         'N');
+    blas.addOperationConfig(M, N, K, ldaFor('T', M, K), ldbFor('N', K, N), M,
+                            'T', 'N', Epilogue::Default);
     std::fill(ref.begin(), ref.end(), 0.f);
     refMatmul(ref.data(), At, B, M, N, K, 1.f, 0.f, true, false);
     blas.matmul('T', 'N', M, N, K, 1.f, dAt, dB, 0.f, dC);
@@ -87,8 +87,8 @@ static void runGpuTests(const std::string &backend) {
         alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(N * K));
     alpaka::memcpy(queue, dBt, hBt);
     alpaka::wait(queue);
-    blas.addLayoutConfig(M, N, K, ldaFor('N', M, K), ldbFor('T', K, N), M, 'N',
-                         'T');
+    blas.addOperationConfig(M, N, K, ldaFor('N', M, K), ldbFor('T', K, N), M,
+                            'N', 'T', Epilogue::Default);
     std::fill(ref.begin(), ref.end(), 0.f);
     refMatmul(ref.data(), A, Bt, M, N, K, 1.f, 0.f, false, true);
     blas.matmul('N', 'T', M, N, K, 1.f, dA, dBt, 0.f, dC);
@@ -126,8 +126,8 @@ static void runGpuTests(const std::string &backend) {
         alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(K * M));
     alpaka::memcpy(queue, dAt, hAt);
     alpaka::wait(queue);
-    blas.addLayoutConfig(M, N, K, ldaFor('T', M, K), ldbFor('N', K, N), M, 'T',
-                         'N');
+    blas.addOperationConfig(M, N, K, ldaFor('T', M, K), ldbFor('N', K, N), M,
+                            'T', 'N', Epilogue::Bias);
     std::fill(ref.begin(), ref.end(), 0.f);
     refGemm(ref.data(), At, B, bias, M, N, K, 1.f, 0.f, true, false);
     blas.gemm('T', 'N', M, N, K, 1.f, dAt, dB, 0.f, dBias, dC);
@@ -155,7 +155,7 @@ static void runGpuTests(const std::string &backend) {
     alpaka::memcpy(queue, dBp, hBp);
     alpaka::memcpy(queue, dBiasz, hBiasz);
     alpaka::wait(queue);
-    blas.addLayoutConfig(M, N, K, M, K, M, 'N', 'N');
+    blas.addOperationConfig(M, N, K, M, K, M, 'N', 'N', Epilogue::ReluBias);
     std::fill(ref.begin(), ref.end(), 0.f);
     refGemmRelu(ref.data(), Ap, Bp, alpaka::getPtrNative(hBiasz), M, N, K, 1.f,
                 0.f, false, false);

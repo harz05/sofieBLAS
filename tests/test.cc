@@ -94,10 +94,6 @@ static void checkClose(const float *got, const float *expected, int n,
     ++gFailures;
 }
 
-// ---------------------------------------------------------------------------
-// Helpers to fill test matrices
-// ---------------------------------------------------------------------------
-
 static void fillSeq(float *M, int n, float start = 1.f, float step = 1.f) {
   for (int i = 0; i < n; ++i)
     M[i] = start + static_cast<float>(i) * step;
@@ -342,11 +338,206 @@ static int ldaFor(char trans, int m, int k) {
 static int ldbFor(char trans, int k, int n) {
   return (trans == 'N' || trans == 'n') ? k : n;
 }
-#endif
-
-#if defined(ALPAKA_ACC_GPU_CUDA_ENABLED) || defined(ALPAKA_ACC_GPU_HIP_ENABLED)
 #include "gpu_tests.tpp"
 #endif
+
+// ---------------------------------------------------------------------------
+// CUDA tests
+// ---------------------------------------------------------------------------
+
+#ifdef ALPAKA_ACC_GPU_CUDA_ENABLED
+
+static void runDynamicShapeTests() {
+  std::cout << "\n=== CUDA Dynamic-Shape Tests ===\n";
+
+  alpaka::PlatformCudaRt platform{};
+  auto dev = alpaka::getDevByIdx(platform, 0u);
+  alpaka::Queue<alpaka::DevCudaRt, alpaka::NonBlocking> queue{dev};
+
+  alpaka::PlatformCpu hostPlatform{};
+  auto hostDev = alpaka::getDevByIdx(hostPlatform, 0u);
+
+  // M0 is the construction-time size given to addOperationConfig; the buffers
+  // hold MCAP rows so sizes above M0 are exercised too.
+  constexpr int MCAP = 96, M0 = 64, N = 3, K = 5;
+
+  auto hA = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(MCAP * K));
+  auto hB = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(K * N));
+  auto hC = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(MCAP * N));
+  float *A = alpaka::getPtrNative(hA);
+  float *B = alpaka::getPtrNative(hB);
+  float *C = alpaka::getPtrNative(hC);
+  fillSeq(A, MCAP * K, 0.5f, 0.25f);
+  fillSeq(B, K * N, 1.f, 0.5f);
+
+  auto dA =
+      alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(MCAP * K));
+  auto dB = alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(K * N));
+  auto dC =
+      alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(MCAP * N));
+  alpaka::memcpy(queue, dA, hA);
+  alpaka::memcpy(queue, dB, hB);
+  alpaka::wait(queue);
+
+  // One instance serving sizes never passed to addOperationConfig (issue #10),
+  // including m=1 and a size above the construction-time one.
+  sofieBLAS<alpaka::TagGpuCudaRt> blas(queue);
+  blas.addOperationConfig(M0, N, K, ldaFor('N', M0, K), ldbFor('N', K, N), M0,
+                          'N', 'N', Epilogue::Default);
+
+  std::vector<float> ref;
+  auto runAt = [&](int m, const std::string &name) {
+    ref.assign(static_cast<std::size_t>(m) * N, 0.f);
+    refMatmul(ref.data(), A, B, m, N, K, 1.f, 0.f, false, false);
+    blas.matmul('N', 'N', static_cast<unsigned>(m), static_cast<unsigned>(N),
+                static_cast<unsigned>(K), 1.f, dA, dB, 0.f, dC);
+    alpaka::memcpy(queue, hC, dC);
+    alpaka::wait(queue);
+    checkClose(C, ref.data(), m * N, name);
+  };
+
+  for (int m : {M0, 37, 8, 51, 1, M0, MCAP})
+    runAt(m, "cuda::dynamic m=" + std::to_string(m));
+
+  // Generated code calls the raw-pointer overloads; one call keeps them
+  // compiled and resolving to the right overload.
+  ref.assign(static_cast<std::size_t>(45) * N, 0.f);
+  refMatmul(ref.data(), A, B, 45, N, K, 1.f, 0.f, false, false);
+  blas.matmul('N', 'N', 45u, static_cast<unsigned>(N), static_cast<unsigned>(K),
+              1.f, alpaka::getPtrNative(dA), alpaka::getPtrNative(dB), 0.f,
+              alpaka::getPtrNative(dC));
+  alpaka::memcpy(queue, hC, dC);
+  alpaka::wait(queue);
+  checkClose(C, ref.data(), 45 * N, "cuda::dynamic raw pointers m=45");
+
+  // 32 distinct sizes through a cache limited to 8 entries.
+  {
+    sofieBLAS<alpaka::TagGpuCudaRt> capped(queue, 8);
+    capped.addOperationConfig(M0, N, K, ldaFor('N', M0, K), ldbFor('N', K, N),
+                              M0, 'N', 'N', Epilogue::Default);
+    float worst = 0.f;
+    for (int m = M0 + 1; m <= MCAP; ++m) {
+      ref.assign(static_cast<std::size_t>(m) * N, 0.f);
+      refMatmul(ref.data(), A, B, m, N, K, 1.f, 0.f, false, false);
+      capped.matmul('N', 'N', static_cast<unsigned>(m),
+                    static_cast<unsigned>(N), static_cast<unsigned>(K), 1.f, dA,
+                    dB, 0.f, dC);
+      alpaka::memcpy(queue, hC, dC);
+      alpaka::wait(queue);
+      for (std::size_t i = 0; i < ref.size(); ++i)
+        worst = std::max(worst, std::abs(C[i] - ref[i]));
+    }
+    if (capped.algoCacheSize() <= 8 && worst < 1e-3f) {
+      std::cout << "  PASS  cuda::cache limit honoured\n";
+    } else {
+      std::cerr << "  FAIL [cuda::cache limit honoured] "
+                << capped.algoCacheSize() << " entries, worst err " << worst
+                << "\n";
+      ++gFailures;
+    }
+  }
+}
+
+#endif // ALPAKA_ACC_GPU_CUDA_ENABLED
+
+// ---------------------------------------------------------------------------
+// HIP tests
+// ---------------------------------------------------------------------------
+
+#ifdef ALPAKA_ACC_GPU_HIP_ENABLED
+
+static void runHipDynamicShapeTests() {
+  std::cout << "\n=== HIP Dynamic-Shape Tests ===\n";
+
+  alpaka::PlatformHipRt platform{};
+  auto dev = alpaka::getDevByIdx(platform, 0u);
+  alpaka::Queue<alpaka::DevHipRt, alpaka::NonBlocking> queue{dev};
+
+  alpaka::PlatformCpu hostPlatform{};
+  auto hostDev = alpaka::getDevByIdx(hostPlatform, 0u);
+
+  // M0 is the construction-time size given to addOperationConfig; the buffers
+  // hold MCAP rows so sizes above M0 are exercised too.
+  constexpr int MCAP = 96, M0 = 64, N = 3, K = 5;
+
+  auto hA = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(MCAP * K));
+  auto hB = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(K * N));
+  auto hC = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(MCAP * N));
+  float *A = alpaka::getPtrNative(hA);
+  float *B = alpaka::getPtrNative(hB);
+  float *C = alpaka::getPtrNative(hC);
+  fillSeq(A, MCAP * K, 0.5f, 0.25f);
+  fillSeq(B, K * N, 1.f, 0.5f);
+
+  auto dA =
+      alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(MCAP * K));
+  auto dB = alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(K * N));
+  auto dC =
+      alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(MCAP * N));
+  alpaka::memcpy(queue, dA, hA);
+  alpaka::memcpy(queue, dB, hB);
+  alpaka::wait(queue);
+
+  // One instance serving sizes never passed to addOperationConfig (issue #10),
+  // including m=1 and a size above the construction-time one.
+  sofieBLAS<alpaka::TagGpuHipRt> blas(queue);
+  blas.addOperationConfig(M0, N, K, ldaFor('N', M0, K), ldbFor('N', K, N), M0,
+                          'N', 'N', Epilogue::Default);
+
+  std::vector<float> ref;
+  auto runAt = [&](int m, const std::string &name) {
+    ref.assign(static_cast<std::size_t>(m) * N, 0.f);
+    refMatmul(ref.data(), A, B, m, N, K, 1.f, 0.f, false, false);
+    blas.matmul('N', 'N', static_cast<unsigned>(m), static_cast<unsigned>(N),
+                static_cast<unsigned>(K), 1.f, dA, dB, 0.f, dC);
+    alpaka::memcpy(queue, hC, dC);
+    alpaka::wait(queue);
+    checkClose(C, ref.data(), m * N, name);
+  };
+
+  for (int m : {M0, 37, 8, 51, 1, M0, MCAP})
+    runAt(m, "hip::dynamic m=" + std::to_string(m));
+
+  // Generated code calls the raw-pointer overloads; one call keeps them
+  // compiled and resolving to the right overload.
+  ref.assign(static_cast<std::size_t>(45) * N, 0.f);
+  refMatmul(ref.data(), A, B, 45, N, K, 1.f, 0.f, false, false);
+  blas.matmul('N', 'N', 45u, static_cast<unsigned>(N), static_cast<unsigned>(K),
+              1.f, alpaka::getPtrNative(dA), alpaka::getPtrNative(dB), 0.f,
+              alpaka::getPtrNative(dC));
+  alpaka::memcpy(queue, hC, dC);
+  alpaka::wait(queue);
+  checkClose(C, ref.data(), 45 * N, "hip::dynamic raw pointers m=45");
+
+  // 32 distinct sizes through a cache limited to 8 entries.
+  {
+    sofieBLAS<alpaka::TagGpuHipRt> capped(queue, 8);
+    capped.addOperationConfig(M0, N, K, ldaFor('N', M0, K), ldbFor('N', K, N),
+                              M0, 'N', 'N', Epilogue::Default);
+    float worst = 0.f;
+    for (int m = M0 + 1; m <= MCAP; ++m) {
+      ref.assign(static_cast<std::size_t>(m) * N, 0.f);
+      refMatmul(ref.data(), A, B, m, N, K, 1.f, 0.f, false, false);
+      capped.matmul('N', 'N', static_cast<unsigned>(m),
+                    static_cast<unsigned>(N), static_cast<unsigned>(K), 1.f, dA,
+                    dB, 0.f, dC);
+      alpaka::memcpy(queue, hC, dC);
+      alpaka::wait(queue);
+      for (std::size_t i = 0; i < ref.size(); ++i)
+        worst = std::max(worst, std::abs(C[i] - ref[i]));
+    }
+    if (capped.algoCacheSize() <= 8 && worst < 1e-3f) {
+      std::cout << "  PASS  hip::cache limit honoured\n";
+    } else {
+      std::cerr << "  FAIL [hip::cache limit honoured] "
+                << capped.algoCacheSize() << " entries, worst err " << worst
+                << "\n";
+      ++gFailures;
+    }
+  }
+}
+
+#endif // ALPAKA_ACC_GPU_HIP_ENABLED
 
 // ---------------------------------------------------------------------------
 // main
@@ -358,9 +549,11 @@ int main() {
 #endif
 #ifdef ALPAKA_ACC_GPU_CUDA_ENABLED
   runGpuTests<alpaka::TagGpuCudaRt>("CUDA");
+  runDynamicShapeTests();
 #endif
 #ifdef ALPAKA_ACC_GPU_HIP_ENABLED
   runGpuTests<alpaka::TagGpuHipRt>("HIP");
+  runHipDynamicShapeTests();
 #endif
 
   std::cout << "\n";
