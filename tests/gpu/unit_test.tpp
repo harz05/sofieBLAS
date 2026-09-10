@@ -219,3 +219,100 @@ static void runGpuTests(const std::string &backend) {
     verify(backend + "::matmul zero-A");
   }
 }
+
+template <typename TTag>
+static void runGpuDynamicShapeTests(const std::string &backend) {
+  std::cout << "\n=== " << backend << " Dynamic-Shape Tests ===\n";
+
+  using Acc = alpaka::TagToAcc<TTag, Dim1D, Idx>;
+  using DevAcc = alpaka::Dev<Acc>;
+  using PlatformAcc = alpaka::Platform<Acc>;
+
+  PlatformAcc platform{};
+  auto dev = alpaka::getDevByIdx(platform, 0u);
+  alpaka::Queue<DevAcc, alpaka::NonBlocking> queue{dev};
+
+  alpaka::PlatformCpu hostPlatform{};
+  auto hostDev = alpaka::getDevByIdx(hostPlatform, 0u);
+
+  // M0 is the construction-time size given to addOperationConfig; the buffers
+  // hold MCAP rows so sizes above M0 are exercised too.
+  constexpr int MCAP = 96, M0 = 64, N = 3, K = 5;
+
+  auto hA = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(MCAP * K));
+  auto hB = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(K * N));
+  auto hC = alpaka::allocBuf<float, Idx>(hostDev, static_cast<Idx>(MCAP * N));
+  float *A = alpaka::getPtrNative(hA);
+  float *B = alpaka::getPtrNative(hB);
+  float *C = alpaka::getPtrNative(hC);
+  fillSeq(A, MCAP * K, 0.5f, 0.25f);
+  fillSeq(B, K * N, 1.f, 0.5f);
+
+  auto dA =
+      alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(MCAP * K));
+  auto dB = alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(K * N));
+  auto dC =
+      alpaka::allocAsyncBuf<float, Idx>(queue, static_cast<Idx>(MCAP * N));
+  alpaka::memcpy(queue, dA, hA);
+  alpaka::memcpy(queue, dB, hB);
+  alpaka::wait(queue);
+
+  // One instance serving sizes never passed to addOperationConfig (issue #10),
+  // including m=1 and a size above the construction-time one.
+  sofieBLAS<TTag> blas(queue);
+  blas.addOperationConfig(M0, N, K, ldaFor('N', M0, K), ldbFor('N', K, N), M0,
+                          'N', 'N', Epilogue::Default);
+
+  std::vector<float> ref;
+  auto runAt = [&](int m, const std::string &name) {
+    ref.assign(static_cast<std::size_t>(m) * N, 0.f);
+    refMatmul(ref.data(), A, B, m, N, K, 1.f, 0.f, false, false);
+    blas.matmul('N', 'N', static_cast<unsigned>(m), static_cast<unsigned>(N),
+                static_cast<unsigned>(K), 1.f, dA, dB, 0.f, dC);
+    alpaka::memcpy(queue, hC, dC);
+    alpaka::wait(queue);
+    checkClose(C, ref.data(), m * N, name);
+  };
+
+  for (int m : {M0, 37, 8, 51, 1, M0, MCAP})
+    runAt(m, backend + "::dynamic m=" + std::to_string(m));
+
+  // Generated code calls the raw-pointer overloads; one call keeps them
+  // compiled and resolving to the right overload.
+  ref.assign(static_cast<std::size_t>(45) * N, 0.f);
+  refMatmul(ref.data(), A, B, 45, N, K, 1.f, 0.f, false, false);
+  blas.matmul('N', 'N', 45u, static_cast<unsigned>(N), static_cast<unsigned>(K),
+              1.f, alpaka::getPtrNative(dA), alpaka::getPtrNative(dB), 0.f,
+              alpaka::getPtrNative(dC));
+  alpaka::memcpy(queue, hC, dC);
+  alpaka::wait(queue);
+  checkClose(C, ref.data(), 45 * N, backend + "::dynamic raw pointers m=45");
+
+  // 32 distinct sizes through a cache limited to 8 entries.
+  {
+    sofieBLAS<TTag> capped(queue, 8);
+    capped.addOperationConfig(M0, N, K, ldaFor('N', M0, K), ldbFor('N', K, N),
+                              M0, 'N', 'N', Epilogue::Default);
+    float worst = 0.f;
+    for (int m = M0 + 1; m <= MCAP; ++m) {
+      ref.assign(static_cast<std::size_t>(m) * N, 0.f);
+      refMatmul(ref.data(), A, B, m, N, K, 1.f, 0.f, false, false);
+      capped.matmul('N', 'N', static_cast<unsigned>(m),
+                    static_cast<unsigned>(N), static_cast<unsigned>(K), 1.f, dA,
+                    dB, 0.f, dC);
+      alpaka::memcpy(queue, hC, dC);
+      alpaka::wait(queue);
+      for (std::size_t i = 0; i < ref.size(); ++i)
+        worst = std::max(worst, std::abs(C[i] - ref[i]));
+    }
+    if (capped.algoCacheSize() <= 8 && worst < 1e-3f) {
+      std::cout << "  PASS  " << backend << "::cache limit honoured\n";
+    } else {
+      std::cerr << "  FAIL [" << backend << "::cache limit honoured] "
+                << capped.algoCacheSize() << " entries, worst err " << worst
+                << "\n";
+      ++gFailures;
+    }
+  }
+}
+
